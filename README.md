@@ -1,34 +1,54 @@
 
-<!-- Custom fork notice -->
+<!-- 中文说明（本 fork 主页优先展示） -->
 
 > [!WARNING]
-> ### 这是个人修改版（fork），不是 QuickLook 官方版本
+> **这是个人修改版（fork），不是 QuickLook 官方版本。**
 > 官方版本与下载请前往 **[QL-Win/QuickLook](https://github.com/QL-Win/QuickLook)**。
->
-> **本分支只改了一件事：让视频预览的键盘操作真正可用。**
->
-> - `←` / `→` — 快退 / 快进 **5 秒**
-> - `↑` / `↓` — 音量 **−5% / +5%**
-> - `空格`（资源管理器内）— 打开预览，**键盘焦点直接落在视频上**，不用再点一下窗口
-> - `ESC` — 关闭预览，焦点自动回到资源管理器，方向键恢复「选择文件」
->
-> **仅视频生效**：音频（mp3 / flac）、图片、PDF、Office 等其他预览类型的行为与官方版**完全一致**。
->
-> **单击不再播放 / 暂停**（按需求移除），按住拖动移动窗口保留；顺带修掉了「窗口最大化时点击崩溃」的 `DragMove` 异常。
-> 预览窗口已打开时，在资源管理器里用方向键切换文件、预览跟随更新的原有行为**不受影响**。
->
-> **改动范围**：4 个文件，+169 / −4
-> `QuickLook.Common/Plugin/ContextObject.cs`（新增 `FocusOnOpen` 接口）、
-> `QuickLook/ViewerWindow.Actions.cs`（宿主响应聚焦请求）、
-> `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Plugin.cs`（仅视频请求聚焦）、
-> `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/ViewerPanel.xaml.cs`（按键 / 聚焦 / 拖动逻辑）
->
-> **基线**：官方 `master` @ `2ec219a`，其上 3 个功能提交 —— `ae94f64`（方向键 seek / 音量 + 自动聚焦）、
-> `fad387f`（等窗口激活后再聚焦）、`d84f26f`（移除焦点调试日志）。
-> 安装包未上传至 Releases，需用官方构建脚本自行编译。
->
-> *English: a personal fork of QuickLook adding arrow-key seek/volume and auto-focus for video previews.
-> Only 4 files are touched; audio and every other preview type behave exactly like upstream.*
+
+# QuickLook · 自定义版
+
+在官方版基础上只做一件事：**让视频预览的键盘操作真正可用** —— 按空格打开视频后，方向键立刻生效，不用先点一下窗口。
+
+## 快捷键
+
+| 按键 | 行为 |
+|---|---|
+| `←` / `→` | 快退 / 快进 **5 秒** |
+| `↑` / `↓` | 音量 **−5% / +5%** |
+| `空格`（资源管理器内选中视频） | 打开预览，**键盘焦点直接落在视频上** |
+| `ESC` | 关闭预览，焦点回到资源管理器，方向键恢复「选择文件」 |
+
+按方向键时控制栏会短暂浮现，给出进度 / 音量反馈。
+
+## 行为说明
+
+- **仅视频生效**：音频（mp3 / flac）、图片、PDF、Office 等其他预览类型与官方版**完全一致**。
+- **单击不再播放 / 暂停**（按需求移除）；按住拖动移动窗口保留，并顺带修掉了「窗口最大化时点击崩溃」的 `DragMove` 异常。
+- 预览窗口已打开时，在资源管理器里用方向键切换文件、预览跟随更新的原有行为**不受影响**。
+- 空格仍然是「关闭预览」，没有被占用为播放 / 暂停。
+
+## 改动范围
+
+4 个文件，+169 / −4：
+
+| 文件 | 改动 |
+|---|---|
+| `QuickLook.Common/Plugin/ContextObject.cs` | 新增 `FocusOnOpen` 属性（插件向宿主请求聚焦的接口） |
+| `QuickLook/ViewerWindow.Actions.cs` | 窗口首次显示时响应 `FocusOnOpen` |
+| `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Plugin.cs` | 仅视频预览设置 `FocusOnOpen = true`（音频不设置） |
+| `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/ViewerPanel.xaml.cs` | 方向键 / 音量 / 聚焦 / 拖动逻辑 |
+
+## 版本
+
+- 基线：官方 `master` @ `2ec219a`
+- 功能提交：`ae94f64`（方向键 seek / 音量 + 自动聚焦）→ `fad387f`（等窗口激活后再聚焦）→ `d84f26f`（移除调试日志）
+- 安装包未上传至 Releases；本机构建产物的版本号 `4.5.0-3-g9e4ad85` 是 rebase **之前**的哈希，代码与 `d84f26f` 完全一致。
+
+---
+
+<sub>以下为 **QuickLook 官方英文 README**，为便于与上游同步而原样保留 → [QL-Win/QuickLook](https://github.com/QL-Win/QuickLook)</sub>
+
+---
 
 <!-- Hero Section with Gradient Background Effect -->
 <picture>
