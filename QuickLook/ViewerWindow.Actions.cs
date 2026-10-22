@@ -330,7 +330,7 @@ public partial class ViewerWindow
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 this.BringToFront(Topmost);
-                if (SettingHelper.Get("FocusWindowOnOpen", false))
+                if (SettingHelper.Get("FocusWindowOnOpen", false) || ContextObject.FocusOnOpen)
                     Activate();
             }), DispatcherPriority.Render);
             if (!SettingHelper.Get("ShowWindowTransition", true, "QuickLook"))

@@ -52,6 +52,7 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
     private MidiPlayer _midiPlayer;
 
     private bool _hasVideo;
+    private bool _isVideoFile;
     private bool _isPlaying;
     private bool _wasPlaying;
     private bool _shouldLoop;
@@ -109,6 +110,10 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         };
 
         PreviewMouseWheel += (_, e) => ChangeVolume(e.Delta / 120d * 0.04d);
+
+        Focusable = true;
+        PreviewKeyDown += ViewerPanel_PreviewKeyDown;
+        Loaded += ViewerPanel_Loaded;
     }
 
     private partial void LoadAndInsertGlassLayer();
@@ -200,15 +205,81 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     private void Panel_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
+        // Clicking the video area also gives it keyboard focus, so arrow-key
+        // shortcuts keep working after switching back from another window.
+        Focus();
+
         if (e.LeftButton == MouseButtonState.Pressed)
         {
             var wnd = Window.GetWindow(this);
-            // Do not allow dragging when window is borderless (e.g. fullscreen)
-            if (wnd?.WindowStyle == WindowStyle.None)
+            // Do not allow dragging when the window is borderless (e.g. fullscreen)
+            // or maximized (DragMove throws InvalidOperationException when maximized).
+            if (wnd?.WindowStyle == WindowStyle.None || wnd?.WindowState == WindowState.Maximized)
                 return;
 
-            wnd?.DragMove();
+            try
+            {
+                wnd?.DragMove();
+            }
+            catch (InvalidOperationException)
+            {
+                // Ignore exception if mouse state changed unexpectedly during drag
+            }
         }
+    }
+
+    private void ViewerPanel_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (!_isVideoFile)
+            return;
+
+        // Take keyboard focus for video previews so that arrow-key shortcuts work
+        // immediately. The host window itself is activated by the main program
+        // (ContextObject.FocusOnOpen), and only when the window is freshly shown.
+        Focus();
+    }
+
+    private void ViewerPanel_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        // Do not interfere when a modifier key is held, keeping system shortcuts intact.
+        if (Keyboard.Modifiers != ModifierKeys.None)
+            return;
+
+        switch (e.Key)
+        {
+            case Key.Left:
+                Seek(-TimeSpan.FromSeconds(5).Ticks);
+                ShowViedoControlContainer(null, null);
+                e.Handled = true;
+                break;
+
+            case Key.Right:
+                Seek(TimeSpan.FromSeconds(5).Ticks);
+                ShowViedoControlContainer(null, null);
+                e.Handled = true;
+                break;
+
+            case Key.Up:
+                ChangeVolume(0.05d);
+                ShowViedoControlContainer(null, null);
+                e.Handled = true;
+                break;
+
+            case Key.Down:
+                ChangeVolume(-0.05d);
+                ShowViedoControlContainer(null, null);
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void Seek(long deltaTicks)
+    {
+        if (mediaElement == null || mediaElement.MediaDuration <= 0)
+            return;
+
+        var target = Math.Max(0, Math.Min(mediaElement.MediaDuration, mediaElement.MediaPosition + deltaTicks));
+        mediaElement.MediaPosition = target;
     }
 
     public event PropertyChangedEventHandler PropertyChanged;
@@ -402,11 +473,17 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     private void ChangeVolume(double delta)
     {
+        if (mediaElement == null)
+            return;
+
         LinearVolume = Math.Max(0d, Math.Min(1d, LinearVolume + delta));
     }
 
     private void TogglePlayPause(object sender, EventArgs e)
     {
+        if (mediaElement == null)
+            return;
+
         if (mediaElement.IsPlaying)
             mediaElement.Pause();
         else
@@ -457,6 +534,11 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     public void LoadAndPlay(string path, MediaInfoNative info)
     {
+        // Remember whether this preview contains a video stream; only video
+        // previews take keyboard focus automatically (audio previews keep the
+        // default behaviour so arrow keys still navigate files in Explorer).
+        _isVideoFile = !string.IsNullOrWhiteSpace(info?.Get(StreamKind.Video, 0, "Format"));
+
         // Detect whether it is other playback formats
         if (!HasVideo)
         {

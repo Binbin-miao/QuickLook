@@ -110,6 +110,11 @@ public sealed class Plugin : IViewer
             context.TitlebarAutoHide = true;
             context.Theme = Themes.Dark;
             context.TitlebarBlurVisibility = true;
+
+            // Let the host activate the preview window for videos so that arrow-key
+            // shortcuts work without an extra click. Audio previews keep the default
+            // behaviour (keyboard focus stays in the file manager).
+            context.FocusOnOpen = true;
         }
         else // audio
         {

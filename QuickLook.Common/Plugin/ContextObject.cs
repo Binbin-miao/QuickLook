@@ -41,6 +41,7 @@ public class ContextObject : INotifyPropertyChanged
     private object _viewerContent;
     private string _colorProfileName = null;
     private bool _isBlocked;
+    private bool _focusOnOpen;
 
     /// <summary>
     /// Get the instance of Viewer window.
@@ -212,6 +213,23 @@ public class ContextObject : INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// Request the viewer window to take foreground focus when it is freshly shown
+    /// (a new preview). Plugins can set this in Prepare() so that keyboard input
+    /// reaches the plugin content without an extra click (e.g. video playback shortcuts).
+    /// In-place file switching (window already visible) is intentionally not affected.
+    /// </summary>
+    public bool FocusOnOpen
+    {
+        get => _focusOnOpen;
+        set
+        {
+            if (value == _focusOnOpen) return;
+            _focusOnOpen = value;
+            OnPropertyChanged();
+        }
+    }
+
     public event PropertyChangedEventHandler PropertyChanged;
 
     /// <summary>
@@ -257,6 +275,7 @@ public class ContextObject : INotifyPropertyChanged
 
         ColorProfileName = null;
         IsBlocked = false;
+        FocusOnOpen = false;
     }
 
     [NotifyPropertyChangedInvocator]
