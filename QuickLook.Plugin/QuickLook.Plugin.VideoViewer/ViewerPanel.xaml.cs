@@ -176,6 +176,10 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     public void Dispose()
     {
+        var wnd = Window.GetWindow(this);
+        if (wnd != null)
+            wnd.Activated -= OnHostWindowActivated;
+
         // old plugin use an int-typed "Volume" config key ranged from 0 to 100. Let's use a new one here.
         SettingHelper.Set("VolumeDouble", LinearVolume, "QuickLook.Plugin.VideoViewer");
         SettingHelper.Set("ShouldLoop", ShouldLoop, "QuickLook.Plugin.VideoViewer");
@@ -236,7 +240,42 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         // Take keyboard focus for video previews so that arrow-key shortcuts work
         // immediately. The host window itself is activated by the main program
         // (ContextObject.FocusOnOpen), and only when the window is freshly shown.
+        var wnd = Window.GetWindow(this);
+        if (wnd == null)
+            return;
+
+        if (wnd.IsActive)
+        {
+            TakeKeyboardFocus();
+        }
+        else
+        {
+            // Focusing before the window is activated gets overridden by the
+            // activation pipeline (focus would end up on the window itself),
+            // so wait until the host has actually activated the window.
+            wnd.Activated += OnHostWindowActivated;
+        }
+    }
+
+    private void OnHostWindowActivated(object sender, EventArgs e)
+    {
+        if (sender is Window wnd)
+            wnd.Activated -= OnHostWindowActivated;
+
+        TakeKeyboardFocus();
+    }
+
+    private void TakeKeyboardFocus()
+    {
         Focus();
+
+        // Re-assert once the activation/input pipeline has settled; an early
+        // focus attempt alone leaves the keyboard focus on the window itself.
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (IsVisible && IsEnabled)
+                Keyboard.Focus(this);
+        }), DispatcherPriority.Input);
     }
 
     private void ViewerPanel_PreviewKeyDown(object sender, KeyEventArgs e)
