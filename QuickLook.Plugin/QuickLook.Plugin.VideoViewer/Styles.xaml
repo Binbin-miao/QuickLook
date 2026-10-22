@@ -47,6 +47,12 @@
                 <Setter Property="Background" Value="{DynamicResource CardBackground}" />
                 <Setter Property="BorderBrush" Value="{DynamicResource CardBorderBrush}" />
             </Trigger>
+            <!-- 禁用态必须看得出来：VSR 在不受支持的卡上会被置灰，
+                 没有这个触发器的话按钮外观不变，用户只会觉得「点了没反应」。 -->
+            <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.35" />
+                <Setter Property="Cursor" Value="Arrow" />
+            </Trigger>
         </Style.Triggers>
     </Style>
 

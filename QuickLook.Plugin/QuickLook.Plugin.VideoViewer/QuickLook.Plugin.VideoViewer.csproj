@@ -58,6 +58,13 @@
     <ItemGroup>
         <PackageReference Include="QuickLook.LAVFilters" Version="0.81.0" />
         <PackageReference Include="QuickLook.WPFMediaKit" Version="3.0.1" />
+        <PackageReference Include="SharpDX" Version="4.2.0" />
+        <PackageReference Include="SharpDX.DXGI" Version="4.2.0" />
+        <PackageReference Include="SharpDX.Direct3D11" Version="4.2.0" />
+        <PackageReference Include="SharpDX.D3DCompiler" Version="4.2.0" />
+        <PackageReference Include="SharpDX.Direct3D9" Version="4.2.0" />
+        <PackageReference Include="SharpDX.MediaFoundation" Version="4.2.0" />
+        <PackageReference Include="SharpDX.XAudio2" Version="4.2.0" />
         <PackageReference Include="DirectShowLib.Standard" Version="2.1.0" />
         <PackageReference Include="QuickLook.MediaInfo" Version="26.5.0" />
         <PackageReference Include="QuickLook.MediaInfo.Native.win-x64" Version="26.5.0" />

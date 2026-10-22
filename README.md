@@ -5,9 +5,61 @@
 > **这是个人修改版（fork），不是 QuickLook 官方版本。**
 > 官方版本与下载请前往 **[QL-Win/QuickLook](https://github.com/QL-Win/QuickLook)**。
 
-# QuickLook · 自定义版
+# QuickLook · 看片版
 
-在官方版基础上只做一件事：**让视频预览的键盘操作真正可用** —— 按空格打开视频后，方向键立刻生效，不用先点一下窗口。
+在官方版基础上做了两件事：
+
+1. **视频预览换成新的渲染内核**（D3D11 + Media Foundation），并接入 **NVIDIA RTX VSR 超分辨率**；
+2. **键盘操作真正可用** —— 按空格打开视频后，方向键立刻生效，不用先点一下窗口。
+
+## 视频超分（RTX VSR）
+
+按控制栏的 `S/W · H/W` 按钮决定走哪条播放路径：
+
+| 档位 | 播放路径 | VSR |
+|---|---|---|
+| **H/W**（默认） | 新引擎：D3D11 + DXVA 硬解 | 可用 |
+| **S/W** | 原播放器：WPFMediaKit + LAV 软解，**不创建任何 D3D 对象** | 不可用 |
+
+> 显卡跑不了 VSR（AMD / GTX 10 系 / 驱动过旧）时，H/W 会自动退回**原播放器 + LAV 硬解**，
+> 播放本身不受影响，也不会弹错误框。
+
+点 `VSR` 按钮打开的菜单：
+
+![VSR 菜单](docs/vsr/menu.png)
+
+- **质量**：关闭 / 低 / 中 / 高 / 极高
+- **超分辨率**：输出高度的**上限** —— `1K`(1080) / `2K`(1440) / `4K`(2160)。
+  实际倍率由引擎按源高度和窗口尺寸换算，永远不超过这个上限，也不会超过 NGX 规格的 4×。
+- **压缩算法**：`驱动` / `Spline36` / `Jinc3` —— VSR 之后缩到窗口尺寸用的缩放器。
+
+### 三挡位细节对比
+
+同一帧、同一输出尺寸，左 → 右依次是 **驱动双线性 / Spline36 / VSR**（4× 最近邻放大）。
+点开图片可看原始尺寸。
+
+**1K · 1920×1080**
+
+![1K 挡位](docs/vsr/cap-1k.png)
+
+**2K · 2560×1440**
+
+![2K 挡位](docs/vsr/cap-2k.png)
+
+**4K · 3840×2160**
+
+![4K 挡位](docs/vsr/cap-4k.png)
+
+边缘能量（相邻像素亮度差的平均值，越高越锐）：
+
+| 挡位 | 驱动双线性 | Spline36 | **VSR** | VSR / 双线性 |
+|---|---|---|---|---|
+| 1K · 1920×1080 | 3.089 | 3.871 | **4.296** | **+39%** |
+| 2K · 2560×1440 | 2.360 | 2.941 | **3.323** | **+41%** |
+| 4K · 3840×2160 | 1.592 | 1.978 | **2.159** | **+36%** |
+
+测试片 848×478，取 30s 处同一帧；只改「超分辨率」挡位，其余设置不变。
+VSR 不只是比双线性锐，也稳定高于 Spline36（+9% ~ +13%），说明它确实在重建细节而不是插值。
 
 ## 快捷键
 
@@ -26,23 +78,26 @@
 - **单击不再播放 / 暂停**（按需求移除）；按住拖动移动窗口保留，并顺带修掉了「窗口最大化时点击崩溃」的 `DragMove` 异常。
 - 预览窗口已打开时，在资源管理器里用方向键切换文件、预览跟随更新的原有行为**不受影响**。
 - 空格仍然是「关闭预览」，没有被占用为播放 / 暂停。
+- 运行中切换 `S/W · H/W` 会带着播放位置和播放状态切过去，不会回到片头。
+
+## 环境要求
+
+- Windows 10 / 11（x64 / Arm64 原生组件齐全）
+- VSR 需要 **NVIDIA RTX 20 系及以上** + 较新的驱动；不满足时自动降级，不影响普通播放
 
 ## 改动范围
 
-4 个文件，+169 / −4：
-
-| 文件 | 改动 |
-|---|---|
-| `QuickLook.Common/Plugin/ContextObject.cs` | 新增 `FocusOnOpen` 属性（插件向宿主请求聚焦的接口） |
-| `QuickLook/ViewerWindow.Actions.cs` | 窗口首次显示时响应 `FocusOnOpen` |
-| `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Plugin.cs` | 仅视频预览设置 `FocusOnOpen = true`（音频不设置） |
-| `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/ViewerPanel.xaml.cs` | 方向键 / 音量 / 聚焦 / 拖动逻辑 |
+- `QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/` —— 新渲染内核
+  （`VideoEngine` 解码/渲染/音频时钟、`Scaler` 着色器缩放、`AudioOutput`、`TimeStretcher`）
+- `ViewerPanel.xaml(.cs)` —— 路径选择（S/W·H/W）、VSR 菜单、切换时保持位置
+- `Styles.xaml` —— 按钮禁用态
+- `QuickLook.Common/Plugin/ContextObject.cs`、`QuickLook/ViewerWindow.Actions.cs`、`Plugin.cs`
+  —— 键盘聚焦（`FocusOnOpen`）
 
 ## 版本
 
 - 基线：官方 `master` @ `2ec219a`
-- 功能提交：`ae94f64`（方向键 seek / 音量 + 自动聚焦）→ `fad387f`（等窗口激活后再聚焦）→ `d84f26f`（移除调试日志）
-- 安装包未上传至 Releases；本机构建产物的版本号 `4.5.0-3-g9e4ad85` 是 rebase **之前**的哈希，代码与 `d84f26f` 完全一致。
+- 本 fork 的提交与安装包见 **[Releases](https://github.com/Binbin-miao/QuickLook/releases)** 与提交历史
 
 ---
 

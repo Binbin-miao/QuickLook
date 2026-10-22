@@ -22,6 +22,17 @@
     </UserControl.Resources>
     <Grid MouseLeftButtonDown="Panel_MouseLeftButtonDown">
         <mediakit:MediaUriElement x:Name="mediaElement" />
+        <!--  新引擎（D3D11 + RTX VSR）的画面承载层；只有视频且引擎可用时才显示  -->
+        <Border x:Name="videoSurfaceHost"
+                Background="Black"
+                ClipToBounds="True"
+                Visibility="Collapsed">
+            <Image x:Name="videoSurface" Stretch="Uniform">
+                <Image.LayoutTransform>
+                    <RotateTransform x:Name="videoRotation" Angle="0" />
+                </Image.LayoutTransform>
+            </Image>
+        </Border>
         <Grid x:Name="coverArtPersenter"
               Background="{StaticResource MainWindowBackground}"
               ClipToBounds="True">
@@ -105,7 +116,7 @@
                            Padding="3"
                            FontSize="14"
                            Foreground="{DynamicResource WindowTextForeground}"
-                           Text="{Binding ElementName=mediaElement, Path=MediaDuration, Converter={StaticResource TimeTickToShortStringConverter}}"
+                           Text="{Binding MediaDuration, ElementName=viewerPanel, Converter={StaticResource TimeTickToShortStringConverter}}"
                            TextTrimming="CharacterEllipsis" />
                 <TextBlock x:Name="metaLyric"
                            Grid.Row="6"
@@ -212,6 +223,16 @@
                         </TextBlock.Style>
                     </TextBlock>
                 </Button>
+                <Button x:Name="buttonVsr"
+                        Width="58"
+                        DockPanel.Dock="Left"
+                        IsEnabled="{Binding VsrButtonEnabled, ElementName=viewerPanel}"
+                        Style="{StaticResource HardwareAccelerationButtonStyle}"
+                        ToolTip="{Binding VsrButtonToolTip, ElementName=viewerPanel}"
+                        Visibility="{Binding VsrButtonVisibility, ElementName=viewerPanel}">
+                    <TextBlock VerticalAlignment="Center"
+                               Text="{Binding VsrLabel, ElementName=viewerPanel}" />
+                </Button>
                 <Button x:Name="buttonMute"
                         DockPanel.Dock="Right"
                         ToolTip="Volume">
@@ -220,6 +241,15 @@
                             <Setter Property="Content" Value="{Binding ElementName=viewerPanel, Path=LinearVolume, Converter={StaticResource VolumeToIconConverter}}" />
                         </Style>
                     </Button.Style>
+                </Button>
+                <Button x:Name="buttonSpeed"
+                        Width="46"
+                        DockPanel.Dock="Right"
+                        Style="{StaticResource HardwareAccelerationButtonStyle}"
+                        ToolTip="Playback Speed"
+                        Visibility="{Binding HasVideo, ElementName=viewerPanel, Converter={StaticResource BooleanToVisibilityConverter}}">
+                    <TextBlock VerticalAlignment="Center"
+                               Text="{Binding SpeedLabel, ElementName=viewerPanel}" />
                 </Button>
                 <Button x:Name="buttonTime"
                         Width="NaN"
@@ -236,10 +266,10 @@
                             <Style TargetType="TextBlock">
                                 <Style.Triggers>
                                     <DataTrigger Binding="{Binding ElementName=buttonTime, Path=Tag}" Value="Time">
-                                        <Setter Property="Text" Value="{Binding ElementName=mediaElement, Path=MediaPosition, Converter={StaticResource TimeTickToShortStringConverter}}" />
+                                        <Setter Property="Text" Value="{Binding MediaPosition, ElementName=viewerPanel, Converter={StaticResource TimeTickToShortStringConverter}}" />
                                     </DataTrigger>
                                     <DataTrigger Binding="{Binding ElementName=buttonTime, Path=Tag}" Value="Length">
-                                        <Setter Property="Text" Value="{Binding ElementName=mediaElement, Path=MediaDuration, Converter={StaticResource TimeTickToShortStringConverter}}" />
+                                        <Setter Property="Text" Value="{Binding MediaDuration, ElementName=viewerPanel, Converter={StaticResource TimeTickToShortStringConverter}}" />
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
@@ -249,10 +279,10 @@
                 <Slider x:Name="sliderProgress"
                         Delay="1"
                         LargeChange="1"
-                        Maximum="{Binding ElementName=mediaElement, Path=MediaDuration}"
+                        Maximum="{Binding MediaDuration, ElementName=viewerPanel}"
                         SmallChange="1"
                         Style="{StaticResource PositionSliderStyle}"
-                        Value="{Binding MediaPosition, ElementName=mediaElement}" />
+                        Value="{Binding MediaPosition, ElementName=viewerPanel, Mode=TwoWay}" />
             </DockPanel>
         </Grid>
         <Grid x:Name="volumeSliderLayer"
@@ -269,6 +299,46 @@
                         Style="{StaticResource CustomSliderStyle}"
                         Value="{Binding ElementName=viewerPanel, Path=LinearVolume}" />
             </Grid>
+        </Grid>
+        <Grid x:Name="vsrMenuLayer"
+              Background="Transparent"
+              Visibility="Collapsed"
+              MouseLeftButtonDown="VsrMenuLayer_MouseLeftButtonDown">
+            <Border x:Name="vsrPopup"
+                    Padding="8,8"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Top"
+                    CornerRadius="12"
+                    Background="#F21C1C1C">
+                <StackPanel Orientation="Horizontal">
+                    <!-- 左：质量（含关闭） -->
+                    <StackPanel x:Name="vsrQualityItems" Width="62" />
+                    <Border Width="1"
+                            Margin="6,4"
+                            Background="#26FFFFFF" />
+                    <!-- 中：超分倍率 -->
+                    <StackPanel x:Name="vsrScaleItems" Width="62" />
+                    <Border Width="1"
+                            Margin="6,4"
+                            Background="#26FFFFFF" />
+                    <!-- 右：降采样算法 -->
+                    <StackPanel x:Name="vsrAlgoItems" Width="76" />
+                </StackPanel>
+            </Border>
+        </Grid>
+        <Grid x:Name="speedMenuLayer"
+              Background="Transparent"
+              Visibility="Collapsed"
+              MouseLeftButtonDown="SpeedMenuLayer_MouseLeftButtonDown">
+            <Border x:Name="speedPopup"
+                    Width="104"
+                    Padding="6,8"
+                    HorizontalAlignment="Left"
+                    VerticalAlignment="Top"
+                    CornerRadius="12"
+                    Background="#F21C1C1C">
+                <StackPanel x:Name="speedMenuItems" />
+            </Border>
         </Grid>
     </Grid>
 </UserControl>
