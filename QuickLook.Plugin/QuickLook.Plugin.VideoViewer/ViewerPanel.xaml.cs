@@ -53,6 +53,8 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     private bool _hasVideo;
     private bool _isVideoFile;
+    private bool _autoFocusPending;
+    private bool _activatedSubscribed;
     private bool _isPlaying;
     private bool _wasPlaying;
     private bool _shouldLoop;
@@ -114,6 +116,7 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         Focusable = true;
         PreviewKeyDown += ViewerPanel_PreviewKeyDown;
         Loaded += ViewerPanel_Loaded;
+        IsVisibleChanged += ViewerPanel_IsVisibleChanged;
     }
 
     private partial void LoadAndInsertGlassLayer();
@@ -234,43 +237,58 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     private void ViewerPanel_Loaded(object sender, RoutedEventArgs e)
     {
-        if (!_isVideoFile)
-            return;
+        TryAutoFocus();
+    }
 
-        // Take keyboard focus for video previews so that arrow-key shortcuts work
-        // immediately. The host window itself is activated by the main program
-        // (ContextObject.FocusOnOpen), and only when the window is freshly shown.
-        var wnd = Window.GetWindow(this);
-        if (wnd == null)
-            return;
-
-        if (wnd.IsActive)
-        {
-            TakeKeyboardFocus();
-        }
-        else
-        {
-            // Focusing before the window is activated gets overridden by the
-            // activation pipeline (focus would end up on the window itself),
-            // so wait until the host has actually activated the window.
-            wnd.Activated += OnHostWindowActivated;
-        }
+    private void ViewerPanel_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        // The panel stays hidden while the host shows its busy/loading overlay;
+        // once it becomes visible the preview is ready and focus can be taken.
+        if (e.NewValue is true)
+            TryAutoFocus();
     }
 
     private void OnHostWindowActivated(object sender, EventArgs e)
     {
         if (sender is Window wnd)
             wnd.Activated -= OnHostWindowActivated;
+        _activatedSubscribed = false;
 
-        TakeKeyboardFocus();
+        TryAutoFocus();
     }
 
-    private void TakeKeyboardFocus()
+    /// <summary>
+    /// Claim keyboard focus for video previews once all three conditions hold:
+    /// the panel is visible (host busy overlay gone), the panel is enabled and
+    /// the host window is active. Focusing earlier is silently ignored by WPF
+    /// (invisible element) or overridden by the activation pipeline.
+    /// </summary>
+    private void TryAutoFocus()
     {
-        Focus();
+        if (!_autoFocusPending)
+            return;
 
-        // Re-assert once the activation/input pipeline has settled; an early
-        // focus attempt alone leaves the keyboard focus on the window itself.
+        if (!IsVisible || !IsEnabled)
+            return;
+
+        var wnd = Window.GetWindow(this);
+        if (wnd == null)
+            return;
+
+        if (!wnd.IsActive)
+        {
+            if (!_activatedSubscribed)
+            {
+                _activatedSubscribed = true;
+                wnd.Activated += OnHostWindowActivated;
+            }
+            return;
+        }
+
+        _autoFocusPending = false;
+
+        Focus();
+        // Re-assert after the input pipeline settles.
         Dispatcher.BeginInvoke(new Action(() =>
         {
             if (IsVisible && IsEnabled)
@@ -577,6 +595,8 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         // previews take keyboard focus automatically (audio previews keep the
         // default behaviour so arrow keys still navigate files in Explorer).
         _isVideoFile = !string.IsNullOrWhiteSpace(info?.Get(StreamKind.Video, 0, "Format"));
+        if (_isVideoFile)
+            _autoFocusPending = true;
 
         // Detect whether it is other playback formats
         if (!HasVideo)
