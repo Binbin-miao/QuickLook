@@ -7,7 +7,7 @@
 
 ---
 
-## P0 · 引擎拆独立进程（真正的「只重启内核」）
+## ~~P0 · 引擎拆独立进程（真正的「只重启内核」）~~ —— 已完成，见下
 
 **为什么必须拆**
 
@@ -46,16 +46,21 @@
 - 读回共享渲染目标要用 `GetRenderTargetData`，`StretchRectangle` 会报 `D3DERR_INVALIDCALL`；
 - 枚举是 `D3D9.Pool.SystemMemory`（不是 `SystemMem`）。
 
-**清单**
+**清单（全部完成）**
 
-- [ ] 子进程宿主 exe：复用 `VideoEngine`，加一层管道循环（open / seek / pause / rate / volume / VSR / targetSize）
-- [ ] 父进程 `SharedSurfaceHost`：用 D3D9Ex 打开共享句柄，窗口尺寸变化时重建
-- [ ] 抽 `IVideoEngine` 接口 + `VideoEngineProxy`（约 25 个成员转发，帧通知走命名事件）
-- [ ] 面板切到接口，默认走子进程；保留进程内路径作为开关兜底
-- [ ] 空闲回收从「重启整个程序」改成「关掉子进程」
-- [ ] 回归：`vsr` / `algo` / `storm` / `rate` / `nosupport` 五条回路 + UI 宿主菜单连点 + 真机开片关片
+- [x] 子进程宿主 exe：复用 `VideoEngine`，加一层管道循环（open / seek / pause / rate / volume / VSR / targetSize）
+- [x] 父进程 `SharedSurfaceHost`：用 D3D9Ex 打开共享句柄，窗口尺寸变化时重建
+- [x] 抽 `IVideoEngine` 接口 + `VideoEngineProxy`（约 25 个成员转发，帧通知走命名事件）
+- [x] 面板切到接口，默认走子进程；保留进程内路径作为开关兜底
+- [x] 空闲回收从「重启整个程序」改成「关掉子进程」
+- [x] 回归：`vsr` / `algo` / `storm` / `rate` / `nosupport` 五条回路 + UI 宿主菜单连点 + 真机开片关片
 
-**验收标准**
+**验收结果（2026-10-24 07:04，真机）**
+
+连开关 4 部片：主程序 pid 一直是 19824、线程 27~30；引擎子进程在预览期间存在，
+关掉预览等 30 秒后消失；显存 1854MB → 1655MB。UI 宿主 14 次菜单连点 0 stall。
+
+**验收标准（原定）**
 
 连续开关 10 部片：主进程 PID 不变，线程 / 显存 / 内存曲线是一条直线；空闲后子进程消失、资源归零；
 全程零弹窗。

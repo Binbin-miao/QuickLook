@@ -123,7 +123,7 @@ internal static class VsrNative
     public static string LastError => Marshal.PtrToStringUni(VsrLastError()) ?? string.Empty;
 }
 
-public sealed class VideoEngine : IDisposable
+public sealed class VideoEngine : IVideoEngine
 {
     // ---------- 配置 ----------
     /// <summary>
@@ -137,6 +137,16 @@ public sealed class VideoEngine : IDisposable
     public int DownscaleAlgo { get; set; }           // 0 = 驱动 VpBlt, 1 = Spline36
     public bool Loop { get; set; } = true;
 
+    /// <summary>
+    /// true = 只产出「共享句柄」，不建 D3D9Ex 设备（子进程模式）。
+    /// <para>
+    /// 子进程里建 D3D9Ex 共享表面会在**第二张**上吊死：同样的代码在主进程里好好的，
+    /// 只有在「DXVA 正在解码 + 进程里没有 WPF」时必现（实测卡 30s 以上不返回）。
+    /// 改用 D3D11 的共享纹理就没这问题，父进程照样能用 D3D9Ex 打开它。
+    /// </para>
+    /// </summary>
+    public bool SharedOutputOnly { get; set; }
+
     // ---------- 状态 ----------
     public TimeSpan Duration { get; private set; }
     public int SourceWidth { get; private set; }
@@ -149,6 +159,26 @@ public sealed class VideoEngine : IDisposable
 
     /// <summary>每渲染完一帧触发（在解码线程上）。UI 侧应 Dispatcher 回主线程再 AddDirtyRect。</summary>
     public event Action FrameRendered;
+
+    /// <summary>
+    /// 引擎日志出口。插件里接到面板的文件日志；子进程宿主接到自己的日志文件。
+    /// 以前直接调 ViewerPanel.EngineLog，等于引擎反过来依赖面板，
+    /// 子进程宿主就编译不过（探针工程当年就是被这一行卡住的）。
+    /// </summary>
+    public static Action<string> LogSink { get; set; }
+
+    internal static void Log(string message)
+    {
+        try { LogSink?.Invoke(message); } catch { }
+    }
+
+    /// <summary>给代理用：子进程判定 VSR 不可用时，把进程级闩锁打上并通知面板。</summary>
+    internal static void RaiseVsrUnavailable(string reason)
+    {
+        VsrUnsupported = true;
+        VsrUnsupportedReason = reason;
+        VsrUnavailable?.Invoke(reason);
+    }
 
     // 下面这五个都是**借来的**：设备由 GpuContext 全进程共用，引擎只是借用。
     // 绝不能在这里 Dispose —— 一是别的引擎（关掉一个预览、立刻开下一个）正在用，
@@ -432,6 +462,7 @@ public sealed class VideoEngine : IDisposable
             }
             catch (Exception e) { Debug.WriteLine("SetMultithreadProtected: " + e.Message); }
 
+            Log("open: 设备就绪，编译缩放着色器");
             _scaler = new Scaler(_device, _ctx);
             if (!_scaler.Prepare())
             {
@@ -441,8 +472,17 @@ public sealed class VideoEngine : IDisposable
                 _scaler = null;
             }
 
-            CreateD3D9(hwnd);
+            if (SharedOutputOnly)
+            {
+                Log("open: 跳过 D3D9Ex 设备（子进程模式，只产共享句柄）");
+            }
+            else
+            {
+                Log("open: 创建 D3D9Ex 输出设备");
+                CreateD3D9(hwnd);
+            }
 
+            Log("open: 打开 SourceReader");
             var attrs = new MediaAttributes(2);
             attrs.Set(SourceReaderAttributeKeys.D3DManager, _dxgiManager);
 
@@ -457,6 +497,7 @@ public sealed class VideoEngine : IDisposable
                 _reader.SetCurrentMediaType(SourceReaderIndex.FirstVideoStream, mt);
             }
 
+            Log("open: 协商 NV12 输出");
             // 真实画面尺寸要在这里读：解码之后 MF 会把当前媒体类型换成对齐后的尺寸
             int mediaW = 0, mediaH = 0;
             try
@@ -474,6 +515,7 @@ public sealed class VideoEngine : IDisposable
                 Duration = TimeSpan.Zero;
 
             // 先解一帧拿到真实尺寸
+            Log("open: 解第一帧");
             if (!DecodeNext(out var firstTex, out int sub, out long ts))
             {
                 LastError = "无法解码视频帧";
@@ -496,11 +538,14 @@ public sealed class VideoEngine : IDisposable
             SourceWidth = _srcW;
             SourceHeight = _srcH;
 
+            Log("open: 建管线");
             SetupPipeline();
+            Log("open: 渲染第一帧");
             RenderFrame(firstTex, sub);
             // 不再 Dispose：firstTex 是引擎缓存的那张解码缓冲，下一帧还要用
 
             // 音频独立打开；失败不影响视频
+            Log("open: 打开音频");
             OpenAudio(path);
             _audioOk = _audio != null && _audio.IsReady;
             _useAudioClock = _audioOk;
@@ -555,6 +600,7 @@ public sealed class VideoEngine : IDisposable
     /// <summary>输出尺寸 = 源尺寸 × VSR 倍率；共享表面按这个尺寸创建。</summary>
     private void SetupPipeline()
     {
+        Log($"setup: 开始 {_srcW}x{_srcH} target={_targetW}x{_targetH}");
         // 重配时先拆掉上一轮的资源
         _vpOut?.Dispose(); _vpOut = null;
         _vp?.Dispose(); _vp = null;
@@ -603,10 +649,13 @@ public sealed class VideoEngine : IDisposable
             OutputHeight = maxOutH,
             Usage = VideoUsage.PlaybackNormal,
         };
+        Log("setup: 建枚举器");
         _videoDevice.CreateVideoProcessorEnumerator(ref content, out _vpEnum);
+        Log("setup: 建视频处理器");
         _enumOutW = maxOutW;
         _enumOutH = maxOutH;
         _videoDevice.CreateVideoProcessor(_vpEnum, 0, out _vp);
+        Log("setup: 建输出视图");
         _vpW = _bgraW;
         _vpH = _bgraH;
         _videoDevice.CreateVideoProcessorOutputView(_bgraTex, _vpEnum,
@@ -618,7 +667,11 @@ public sealed class VideoEngine : IDisposable
 
         VsrActive = false;
         if (VsrEnabled && EffectiveVsrScale() > 1.0)
+        {
+            Log("setup: 准备 VSR 资源");
             SetupVsrResources();
+            Log("setup: VSR 资源就绪");
+        }
 
         if (!VsrActive)
         {
@@ -635,7 +688,9 @@ public sealed class VideoEngine : IDisposable
             _targetH = _srcH;
         }
 
+        Log("setup: 建输出资源");
         CreateOutputResources();
+        Log("setup: 完成");
     }
 
     /// <summary>
@@ -773,6 +828,7 @@ public sealed class VideoEngine : IDisposable
         _texture9?.Dispose(); _texture9 = null;
         _vpOutFinal?.Dispose(); _vpOutFinal = null;
 
+        Log($"out: 建 D3D11 输出纹理 {_targetW}x{_targetH}");
         _outTex = new D3D11Texture2D(_device, new Texture2DDescription
         {
             Width = _targetW,
@@ -785,13 +841,12 @@ public sealed class VideoEngine : IDisposable
             BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
         });
 
-        _sharedHandle = IntPtr.Zero;
-        _texture9 = new D3D9.Texture(_device9, _targetW, _targetH, 1,
-            D3D9.Usage.RenderTarget, D3D9.Format.A8R8G8B8, D3D9.Pool.Default, ref _sharedHandle);
-        _surface9 = _texture9.GetSurfaceLevel(0);
-        _sharedTex = _device.OpenSharedResource<D3D11Texture2D>(_sharedHandle);
-
-        // 驱动缩放（VideoProcessorBlt）用的输出视图；建不出来就退回着色器
+        // 驱动缩放（VideoProcessorBlt）用的输出视图；建不出来就退回着色器。
+        // 顺序很关键：先建这个视图，再去建 D3D9Ex 共享表面。
+        // 反过来（先建共享表面、再建视频处理器视图）实测会卡死在
+        // CreateVideoProcessorOutputView 里——而同一段代码在进程内跑不出问题，
+        // 只在「另一个进程正开着上一张共享表面」时必现。
+        Log("out: 建 VpBlt 输出视图");
         try
         {
             _videoDevice.CreateVideoProcessorOutputView(_outTex, _vpEnum,
@@ -800,12 +855,52 @@ public sealed class VideoEngine : IDisposable
                     Dimension = VpovDimension.Texture2D,
                     Texture2D = new Texture2DVpov { MipSlice = 0 },
                 }, out _vpOutFinal);
+            Log("out: VpBlt 输出视图 ok");
         }
         catch (Exception e)
         {
             Debug.WriteLine(e.Message);
+            Log("out: VpBlt 输出视图失败 " + e.Message);
             _vpOutFinal = null;
         }
+
+        _sharedHandle = IntPtr.Zero;
+
+        if (SharedOutputOnly)
+        {
+            // 子进程模式：直接建一张 D3D11 共享纹理，把老式 SharedHandle 交出去。
+            // 父进程用 D3D9Ex CreateTexture(handle) 打开的就是同一块显存（跨进程实测通过）。
+            Log($"out: 建 D3D11 共享纹理 {_targetW}x{_targetH}");
+            _sharedTex = new D3D11Texture2D(_device, new Texture2DDescription
+            {
+                Width = _targetW,
+                Height = _targetH,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.ShaderResource,
+                OptionFlags = ResourceOptionFlags.Shared,
+            });
+
+            using (var res = _sharedTex.QueryInterface<SharpDX.DXGI.Resource>())
+            {
+                _sharedHandle = res.SharedHandle;
+            }
+
+            Log($"out: 共享句柄 0x{_sharedHandle.ToInt64():X}");
+            return;
+        }
+
+        Log($"out: 建 D3D9Ex 共享表面 {_targetW}x{_targetH}");
+        _texture9 = new D3D9.Texture(_device9, _targetW, _targetH, 1,
+            D3D9.Usage.RenderTarget, D3D9.Format.A8R8G8B8, D3D9.Pool.Default, ref _sharedHandle);
+        Log("out: 取 surface");
+        _surface9 = _texture9.GetSurfaceLevel(0);
+        Log("out: D3D11 打开共享资源");
+        _sharedTex = _device.OpenSharedResource<D3D11Texture2D>(_sharedHandle);
+        Log("out: 共享表面就绪");
     }
 
     /// <summary>
@@ -835,6 +930,12 @@ public sealed class VideoEngine : IDisposable
     private static int Even(double v) => Math.Max(2, (int)Math.Round(v / 2.0) * 2);
 
     public IntPtr SurfacePointer => _surface9?.NativePointer ?? IntPtr.Zero;
+
+    /// <summary>
+    /// 输出表面的共享句柄。子进程模式下父进程拿它去 D3D9Ex CreateTexture，
+    /// 打开的是同一块显存——画面零拷贝，不用走 CPU。
+    /// </summary>
+    public IntPtr SharedHandle => _sharedHandle;
 
     /// <summary>
     /// 诊断用：把共享表面抽样读回，返回一个校验和。
@@ -2000,7 +2101,7 @@ public sealed class VideoEngine : IDisposable
         }
         catch (Exception e)
         {
-            ViewerPanel.EngineLog($"dispose {name} 失败: {e.GetType().Name}: {e.Message}");
+            Log($"dispose {name} 失败: {e.GetType().Name}: {e.Message}");
         }
     }
 
@@ -2030,7 +2131,7 @@ public sealed class VideoEngine : IDisposable
         // 而且线程数回到基线。出现 False 就说明这次预览的显卡资源整套没还回去。
         int threadsNow = 0;
         try { threadsNow = Process.GetCurrentProcess().Threads.Count; } catch { }
-        ViewerPanel.EngineLog($"dispose video={videoStopped} audio={audioStopped} " +
+        Log($"dispose video={videoStopped} audio={audioStopped} " +
                               $"join={swJoin.ElapsedMilliseconds}ms stage={_diagStage} threads={threadsNow}");
 
         if (!videoStopped || !audioStopped)

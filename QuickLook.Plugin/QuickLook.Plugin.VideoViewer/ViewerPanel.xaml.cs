@@ -79,7 +79,7 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
     private static readonly int[] VsrCaps = { 1080, 1440, 2160 };
 
     // --- 新渲染内核（D3D11 + RTX VSR） ---
-    private VideoEngine _engine;
+    private IVideoEngine _engine;
     private D3DImage _d3dImage;
     private bool _engineActive;
     private int _framePending;
@@ -124,7 +124,15 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         InitializeComponent();
         LoadAndInsertGlassLayer();
 
-        // 空闲回收的计数：面板活着的时候不许重启进程
+        // 引擎日志统一走本文件末尾那个 EngineLog（以前引擎反过来直接调它，
+        // 编译子进程宿主时是死结，现在改成引擎暴露 LogSink）
+        VideoEngine.LogSink = EngineLog;
+
+        // 子进程模式默认开。万一手上有机器跑不起来，把配置项 IsolatedEngine 设成 false
+        // 就退回进程内引擎——两条路走的是同一份引擎源码。
+        VideoEngineProxy.Enabled = SettingHelper.Get("IsolatedEngine", true, "QuickLook.Plugin.VideoViewer");
+
+        // 空闲回收的计数：面板活着的时候不许杀引擎宿主
         EnterPanel();
 
         // apply global theme
@@ -534,34 +542,30 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
     /// </summary>
     private bool TryStartEngine(string path, double rotation)
     {
-        VideoEngine engine = null;
+        IVideoEngine engine = null;
         try
         {
             IntPtr hwnd = IntPtr.Zero;
             var wnd = Window.GetWindow(this);
             if (wnd != null) hwnd = new WindowInteropHelper(wnd).EnsureHandle();
 
-            engine = new VideoEngine
-            {
-                VsrEnabled = _vsrEnabled,
-                VsrCapHeight = _vsrCap,
-                VsrQuality = _vsrQuality,
-                DownscaleAlgo = _vsrAlgo,
-                Rate = _playbackRate,
-                Loop = ShouldLoop,
-                Volume = (float)Math.Max(0d, Math.Min(1d, LinearVolume)),
+            // 进程内还是子进程，只在这里分叉。两边的配置项完全一样，
+            // 因为 VideoEngineProxy 就是照 VideoEngine 的接口做的。
+            engine = VideoEngineProxy.Enabled ? (IVideoEngine)new VideoEngineProxy() : new VideoEngine();
+            engine.VsrEnabled = _vsrEnabled;
+            engine.VsrCapHeight = _vsrCap;
+            engine.VsrQuality = _vsrQuality;
+            engine.DownscaleAlgo = _vsrAlgo;
+            engine.Rate = _playbackRate;
+            engine.Loop = ShouldLoop;
+            engine.Volume = (float)Math.Max(0d, Math.Min(1d, LinearVolume));
+            engine.DiagSink = EngineLog;
+            engine.DiagExtra = () =>
+                $"dirty={_dirtyCount} uiPos={_mediaPosition / 1e7:0.00}s " +
+                $"front={(_frontAvailable ? "ok" : "no")} " +
+                $"pending={_framePending} target={_targetPending} " +
+                $"err={(_dirtyError ?? "-")}";
 
-                // 渲染线程里的异常、卡住时的现场，全部写进同一个日志文件。
-                // 没有这个，出问题只能看到「画面不动」，什么线索都没有。
-                DiagSink = EngineLog,
-
-                // UI 侧的呈现状态：重绘次数能区分「引擎没出帧」和「出了帧但没重绘」
-                DiagExtra = () =>
-                    $"dirty={_dirtyCount} uiPos={_mediaPosition / 1e7:0.00}s " +
-                    $"front={(_frontAvailable ? "ok" : "no")} " +
-                    $"pending={_framePending} target={_targetPending} " +
-                    $"err={(_dirtyError ?? "-")}",
-            };
 
             if (!engine.Open(path, hwnd))
             {
@@ -629,7 +633,7 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
     }
 
     /// <summary>把引擎的 D3D9Ex 共享表面挂到 D3DImage 上。</summary>
-    private void AttachSurface(VideoEngine engine)
+    private void AttachSurface(IVideoEngine engine)
     {
         IntPtr ptr = engine.SurfacePointer;
         if (ptr == IntPtr.Zero) return;
@@ -882,15 +886,11 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     // ============================================================ 空闲回收
     //
-    // 设备已经是全进程共用的（GpuContext），所以「开关预览」不再往进程里钉东西了。
-    // 但那个设备只要给过 Media Foundation 硬解，就住在进程里不走：实测关掉所有预览后
-    // 40MB 显存 + 150~200MB 内存原地不动，Dispose / 强制 GC / MFShutdown / ResetDevice(null)
-    // 全都无效，只有进程退出才清（看过 4K 片会更多）。
+    // 显卡栈现在住在子进程（QuickLook.VideoEngineHost.exe）里，所以「回收」就是
+    // 「把子进程关掉」——主程序不重启、托盘不闪、也不会再被游戏++当成「程序结束」。
     //
-    // 所以这里不是「兜底」，而是唯一的回收手段：
-    //   所有预览都关掉、并且 30 秒内没有新预览 → 静默重启自己，把这笔还回去。
-    // 看片过程中永远不会触发；重启走「先排队等旧进程退出、再起新进程」，
-    // 托盘图标最多闪一下。
+    // 时机：最后一个预览面板关掉、并且 30 秒内没有新的预览。
+    // 看片过程中永远不会触发；期间又开了新片就重新计时。
 
     private static int _recycleToken;       // 每次重新计时 +1，旧的一次性计时器自然作废
     private static int _livePanels;         // 当前活着的预览面板数
@@ -917,69 +917,26 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
 
     private static void ScheduleRecycleIfNeeded()
     {
-        // 这个进程压根没建过引擎设备，没什么好回收的
+        // 这个进程压根没建过引擎，没什么好回收的
         if (!Volatile.Read(ref _gpuDirty)) return;
+
+        // 进程内模式（IsolatedEngine=false）没有可关的东西，设备就住在主进程里
+        if (!VideoEngineProxy.Enabled) return;
 
         // 上一次的计时不一定已经落地（连按空格翻片时，前一次排队的计时还在路上）。
         // 只认最后一次：token 对不上就直接作废，否则「最后一部片子关掉」这一次
-        // 会因为前面那次计时抢先跑完而被吃掉——实测就是这么漏掉回收的。
+        // 会因为前面那次计时抢先跑完而被吃掉。
         int token = Interlocked.Increment(ref _recycleToken);
 
         Task.Delay(RecycleIdleDelayMs).ContinueWith(_ =>
         {
             if (Interlocked.CompareExchange(ref _recycleToken, 0, token) != token) return;
             if (Volatile.Read(ref _livePanels) > 0) return;
+            if (!VideoEngineProxy.HostAlive) return;
 
-            int threads = 0;
-            try { threads = Process.GetCurrentProcess().Threads.Count; } catch { }
-            EngineLog($"recycle: 预览已关闭 {RecycleIdleDelayMs / 1000}s，重启进程归还显卡资源 " +
-                      $"(threads={threads})");
-            RestartSelf();
+            EngineLog($"recycle: 预览已关闭 {RecycleIdleDelayMs / 1000}s，关掉引擎宿主进程归还显卡资源");
+            VideoEngineProxy.ShutdownHost();
         });
-    }
-
-    private static void RestartSelf()
-    {
-        try
-        {
-            string exe = Process.GetCurrentProcess().MainModule?.FileName;
-            if (string.IsNullOrEmpty(exe))
-            {
-                EngineLog("recycle: 拿不到自身路径，放弃");
-                return;
-            }
-
-            // 宿主是单实例（QuickLook.App.Mutex）：直接启动会被新进程自己的 Mutex 检查挡回去，
-            // 所以交给 cmd 延迟一下，等旧进程退出之后再起。
-            // 关键在于后面那个 --ql-restart：带上它，新实例才知道「这是自己人重启」，
-            // 会等 Mutex 真的空出来再接管。不带的话，只要旧进程的 OnExit 慢一点，
-            // 新实例就抢先弹一个「QuickLook 已在运行」——实测就是这么弹出来的。
-            Process.Start(new ProcessStartInfo("cmd.exe",
-                $"/c timeout /t 2 /nobreak >nul & start \"\" \"{exe}\" --ql-restart")
-            {
-                CreateNoWindow = true,
-                UseShellExecute = false,
-            });
-        }
-        catch (Exception e)
-        {
-            EngineLog("recycle 启动失败: " + e.Message);
-            return;
-        }
-
-        // Shutdown 必须回到 UI 线程；走 App.OnExit 才会释放 Mutex、收掉托盘图标
-        try
-        {
-            Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                try { Application.Current.Shutdown(); }
-                catch { Environment.Exit(0); }
-            }));
-        }
-        catch
-        {
-            Environment.Exit(0);
-        }
     }
 
     public void Dispose()
@@ -1398,8 +1355,8 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
     /// <summary>
     /// 把 VSR 设置推到正在跑的引擎上。
     /// <para>
-    /// 分两步：先 <see cref="VideoEngine.Reconfigure"/>（纯字段，0ms）；
-    /// 只有当这个引擎里 NGX 还没初始化过时，才补一次 <see cref="VideoEngine.ActivateVsr"/>。
+    /// 分两步：先 <see cref="IVideoEngine.Reconfigure"/>（换档位）；
+    /// 只有当这个引擎里 NGX 还没初始化过时，才补一次 <see cref="IVideoEngine.ActivateVsr"/>。
     /// 全程不重建引擎、不重挂 D3DImage —— 所以不黑屏、不 seek、不左右跳。
     /// </para>
     /// </summary>

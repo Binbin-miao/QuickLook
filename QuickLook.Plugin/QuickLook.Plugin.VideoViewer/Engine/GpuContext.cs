@@ -20,8 +20,8 @@
 // 反过来，设备全程共用、只开关 SourceReader，第 3 轮起线程/显存/内存就是一条直线。
 //
 // 代价：这套设备一旦建起来就住在进程里（实测 40MB 显存 + 150~200MB 内存，
-// 看过 4K 片会更多）。想把它还回去只能重启进程 —— 那件事交给 ViewerPanel 的
-// 空闲回收（所有预览关掉 30 秒后静默重启），不要在这里试图 Dispose。
+// 看过 4K 片会更多）。想把它还回去只能让进程消失 —— 子进程模式下由 VideoEngineProxy
+// 关掉宿主进程完成（主程序自己不再重启），不要在这里试图 Dispose。
 using System;
 using System.Diagnostics;
 using SharpDX.Direct3D;
@@ -99,14 +99,14 @@ internal static class GpuContext
                 _dxgiManager = manager;
 
                 LastError = null;
-                ViewerPanel.EngineLog($"gpu context 已建立  adapter=vendor ok  " +
+                VideoEngine.Log($"gpu context 已建立  adapter=vendor ok  " +
                                       $"threads={Process.GetCurrentProcess().Threads.Count}");
                 return true;
             }
             catch (Exception e)
             {
                 LastError = e.GetType().Name + ": " + e.Message;
-                ViewerPanel.EngineLog("gpu context 建立失败: " + LastError);
+                VideoEngine.Log("gpu context 建立失败: " + LastError);
                 try { _dxgiManager?.Dispose(); } catch { }
                 try { _videoContext?.Dispose(); } catch { }
                 try { _videoDevice?.Dispose(); } catch { }
