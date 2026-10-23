@@ -580,6 +580,7 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
             engine.FrameRendered += OnEngineFrame;
             _engine = engine;
             _engineActive = true;
+            MarkPreviewStarted();
 
             AttachSurface(engine);
 
@@ -845,13 +846,11 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         _engineActive = false;
 
         if (engine != null)
-        {
             engine.FrameRendered -= OnEngineFrame;
 
-            try { engine.Dispose(); }
-            catch (Exception ex) { Debug.WriteLine(ex.Message); }
-        }
-
+        // 顺序很重要：先把 D3DImage 从共享表面上摘下来，再释放引擎。
+        // 反过来的话，WPF 还拿着一个已经被 Dispose 的 IDirect3DSurface9，
+        // 驱动侧的引用计数永远清不干净——每预览一次就漏一份显卡内存。
         if (_d3dImage != null)
         {
             try
@@ -866,8 +865,121 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
             _d3dImage = null;
         }
 
+        if (engine != null)
+        {
+            try { engine.Dispose(); }
+            catch (Exception ex) { Debug.WriteLine(ex.Message); }
+        }
+
         videoSurfaceHost.Visibility = Visibility.Collapsed;
         if (mediaElement != null) mediaElement.Visibility = Visibility.Visible;
+
+        ScheduleRecycleIfNeeded();
+    }
+
+    // ============================================================ 进程回收
+    //
+    // 每次预览都会新建一整套显卡资源（D3D11 设备、DXVA 解码器、共享表面）。
+    // 关闭时我们确实逐个释放了，但底层原生资源不会跟着还给系统：
+    // 实测每预览一次多 50 多个线程、250MB 显存，关掉 30 秒也不回落，
+    // 只有进程退出才清零。换驱动、加大超时、强制 GC、补 MFShutdown 都试过，无效。
+    //
+    // 所以这里做兜底：预览关闭后看一眼线程数，涨到阈值就静默重启自己。
+    // 重启只发生在「预览已经关了、并且没有新预览」的时候，不会打断正在看的东西。
+
+    private static long _previewEpoch;
+    private static int _recycleScheduled;
+
+    /// <summary>线程数阈值。空载约 30，一次预览 +55，700 大约是十几部片子。</summary>
+    private const int RecycleThreadThreshold = 700;
+
+    /// <summary>
+    /// 硬上限：连按空格翻片时永远凑不出 4 秒空档，线程会一直涨。
+    /// 到这个数就别客气了，关掉预览立刻重启（代价是下一次预览晚 2 秒）。
+    /// </summary>
+    private const int RecycleHardThreadThreshold = 1200;
+
+    /// <summary>关掉预览后等这么久再动手，给「连按空格翻片」留出空档。</summary>
+    private const int RecycleIdleDelayMs = 4000;
+
+    private static void MarkPreviewStarted()
+    {
+        Interlocked.Increment(ref _previewEpoch);
+    }
+
+    private static void ScheduleRecycleIfNeeded()
+    {
+        long epoch = Interlocked.Read(ref _previewEpoch);
+        if (Interlocked.Exchange(ref _recycleScheduled, 1) == 1)
+            return;
+
+        int threads;
+        try { threads = Process.GetCurrentProcess().Threads.Count; }
+        catch { Interlocked.Exchange(ref _recycleScheduled, 0); return; }
+
+        bool urgent = threads >= RecycleHardThreadThreshold;
+        int delay = urgent ? 300 : RecycleIdleDelayMs;
+
+        Task.Delay(delay).ContinueWith(_ =>
+        {
+            Interlocked.Exchange(ref _recycleScheduled, 0);
+
+            // 等待期间又打开了新预览：说明用户还在用，放过这一次。
+            // 硬上限那条不等，涨到这个程度再拖下去就是显存告急。
+            if (!urgent && Interlocked.Read(ref _previewEpoch) != epoch)
+                return;
+
+            int now;
+            try { now = Process.GetCurrentProcess().Threads.Count; }
+            catch { return; }
+
+            if (now < (urgent ? RecycleHardThreadThreshold : RecycleThreadThreshold))
+                return;
+
+            EngineLog($"recycle: 预览已关闭，线程 {now}，重启进程归还显卡资源");
+            RestartSelf();
+        });
+    }
+
+    private static void RestartSelf()
+    {
+        try
+        {
+            string exe = Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(exe))
+            {
+                EngineLog("recycle: 拿不到自身路径，放弃");
+                return;
+            }
+
+            // 宿主是单实例（QuickLook.App.Mutex）：直接启动会被新进程自己的 Mutex 检查挡回去，
+            // 所以交给 cmd 延迟 3 秒，等旧进程彻底退出（含托盘、钩子）之后再起。
+            Process.Start(new ProcessStartInfo("cmd.exe",
+                $"/c timeout /t 3 /nobreak >nul & start \"\" \"{exe}\"")
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+            });
+        }
+        catch (Exception e)
+        {
+            EngineLog("recycle 启动失败: " + e.Message);
+            return;
+        }
+
+        // Shutdown 必须回到 UI 线程；走 App.OnExit 才会释放 Mutex、收掉托盘图标
+        try
+        {
+            Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try { Application.Current.Shutdown(); }
+                catch { Environment.Exit(0); }
+            }));
+        }
+        catch
+        {
+            Environment.Exit(0);
+        }
     }
 
     public void Dispose()

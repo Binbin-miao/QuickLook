@@ -1960,6 +1960,25 @@ public sealed class VideoEngine : IDisposable
 
     // ================================================================ dispose
 
+    /// <summary>
+    /// 释放一件资源，失败只记日志、不往外抛。
+    /// 一整串裸 Dispose() 里只要有一个抛（设备丢失、解码器已经关掉自己），
+    /// 后面的设备/纹理就永远不会释放，显存会一直挂着。
+    /// </summary>
+    private static void Release(string name, IDisposable resource)
+    {
+        if (resource == null) return;
+
+        try
+        {
+            resource.Dispose();
+        }
+        catch (Exception e)
+        {
+            ViewerPanel.EngineLog($"dispose {name} 失败: {e.GetType().Name}: {e.Message}");
+        }
+    }
+
     public void Dispose()
     {
         _running = false;
@@ -1977,8 +1996,17 @@ public sealed class VideoEngine : IDisposable
         // 轻则死锁、重则崩溃——这种情况宁可泄漏也不动。
         bool videoStopped = true;
         bool audioStopped = true;
+        var swJoin = Stopwatch.StartNew();
         try { if (_thread != null) videoStopped = _thread.Join(800); } catch { }
         try { if (_aThread != null) audioStopped = _aThread.Join(800); } catch { }
+        swJoin.Stop();
+
+        // 这两行是长时间运行的体温计：正常一次预览应该 video=True audio=True，
+        // 而且线程数回到基线。出现 False 就说明这次预览的显卡资源整套没还回去。
+        int threadsNow = 0;
+        try { threadsNow = Process.GetCurrentProcess().Threads.Count; } catch { }
+        ViewerPanel.EngineLog($"dispose video={videoStopped} audio={audioStopped} " +
+                              $"join={swJoin.ElapsedMilliseconds}ms stage={_diagStage} threads={threadsNow}");
 
         if (!videoStopped || !audioStopped)
             Debug.WriteLine($"Dispose: videoStopped={videoStopped} audioStopped={audioStopped}，跳过对应释放");
@@ -2006,32 +2034,53 @@ public sealed class VideoEngine : IDisposable
                 try { _ctx?.ClearState(); _ctx?.Flush(); } catch { }
             }
 
-            _sharedTex?.Dispose();
-            _surface9?.Dispose();
-            _texture9?.Dispose();
-            _device9?.Dispose();
-            _d3d9?.Dispose();
+            // 逐个释放，单个失败不能拖垮后面的。
+            // 原来这里是一串裸 Dispose()：任意一个抛异常（设备丢失、解码器已关），
+            // 后面十几个设备/纹理就全留在那里 —— 表现就是「关掉预览显存不还」。
+            Release("sharedTex", _sharedTex);
+            Release("surface9", _surface9);
+            Release("texture9", _texture9);
+            Release("device9", _device9);
+            Release("d3d9", _d3d9);
 
-            _scaler?.Dispose();
-            _vpOutFinal?.Dispose();
-            _outTex?.Dispose();
-            _bgraSrv?.Dispose();
-            _vsrSrv?.Dispose();
+            Release("scaler", _scaler);
+            Release("vpOutFinal", _vpOutFinal);
+            Release("outTex", _outTex);
+            Release("bgraSrv", _bgraSrv);
+            Release("vsrSrv", _vsrSrv);
 
-            _vpOut?.Dispose();
-            _vpIn?.Dispose();
-            _vp?.Dispose();
-            _vpEnum?.Dispose();
-            _vsrOutTex?.Dispose();
-            _bgraTex?.Dispose();
+            Release("vpOut", _vpOut);
+            Release("vpIn", _vpIn);
+            Release("vp", _vp);
+            Release("vpEnum", _vpEnum);
+            Release("vsrOutTex", _vsrOutTex);
+            Release("bgraTex", _bgraTex);
 
-            _reader?.Dispose();
-            _dxgiManager?.Dispose();
+            Release("reader", _reader);
+            Release("dxgiManager", _dxgiManager);
 
-            _videoContext?.Dispose();
-            _videoDevice?.Dispose();
-            _ctx?.Dispose();
-            _device?.Dispose();
+            Release("videoContext", _videoContext);
+            Release("videoDevice", _videoDevice);
+            Release("ctx", _ctx);
+            Release("device", _device);
+
+            // Open() 里每次预览都 MediaManager.Startup()，却从来没 Shutdown 过。
+            // MF 是引用计数的：平台的工作队列线程、解码器缓存都跟着这个计数走，
+            // 只加不减 —— 这就是「每预览一次多 50 多个线程、250MB 显存」的源头。
+            // 必须放在所有 MF 对象释放之后调，否则它会等对象归还而卡住。
+            if (audioStopped)
+            {
+                try
+                {
+                    var swMf = Stopwatch.StartNew();
+                    MediaManager.Shutdown();
+                    ViewerPanel.EngineLog($"mf shutdown {swMf.ElapsedMilliseconds}ms");
+                }
+                catch (Exception e)
+                {
+                    ViewerPanel.EngineLog("mf shutdown 异常: " + e.Message);
+                }
+            }
         }
 
         // 不调 MFShutdown：它要等所有 MF 对象释放完毕才返回，
