@@ -124,6 +124,9 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         InitializeComponent();
         LoadAndInsertGlassLayer();
 
+        // 空闲回收的计数：面板活着的时候不许重启进程
+        EnterPanel();
+
         // apply global theme
         Resources.MergedDictionaries[0].MergedDictionaries.Clear();
 
@@ -877,66 +880,60 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         ScheduleRecycleIfNeeded();
     }
 
-    // ============================================================ 进程回收
+    // ============================================================ 空闲回收
     //
-    // 每次预览都会新建一整套显卡资源（D3D11 设备、DXVA 解码器、共享表面）。
-    // 关闭时我们确实逐个释放了，但底层原生资源不会跟着还给系统：
-    // 实测每预览一次多 50 多个线程、250MB 显存，关掉 30 秒也不回落，
-    // 只有进程退出才清零。换驱动、加大超时、强制 GC、补 MFShutdown 都试过，无效。
+    // 设备已经是全进程共用的（GpuContext），所以「开关预览」不再往进程里钉东西了。
+    // 但那个设备只要给过 Media Foundation 硬解，就住在进程里不走：实测关掉所有预览后
+    // 40MB 显存 + 150~200MB 内存原地不动，Dispose / 强制 GC / MFShutdown / ResetDevice(null)
+    // 全都无效，只有进程退出才清（看过 4K 片会更多）。
     //
-    // 所以这里做兜底：预览关闭后看一眼线程数，涨到阈值就静默重启自己。
-    // 重启只发生在「预览已经关了、并且没有新预览」的时候，不会打断正在看的东西。
+    // 所以这里不是「兜底」，而是唯一的回收手段：
+    //   所有预览都关掉、并且 30 秒内没有新预览 → 静默重启自己，把这笔还回去。
+    // 看片过程中永远不会触发；重启走「先排队等旧进程退出、再起新进程」，
+    // 托盘图标最多闪一下。
 
-    private static long _previewEpoch;
-    private static int _recycleScheduled;
+    private static int _recycleToken;       // 每次重新计时 +1，旧的一次性计时器自然作废
+    private static int _livePanels;         // 当前活着的预览面板数
+    private static bool _gpuDirty;          // 这个进程里跑过 H/W 引擎吗
 
-    /// <summary>线程数阈值。空载约 30，一次预览 +55，700 大约是十几部片子。</summary>
-    private const int RecycleThreadThreshold = 700;
+    /// <summary>关掉预览后等这么久才回收：给「连按空格翻片」留出空档。</summary>
+    private const int RecycleIdleDelayMs = 30_000;
 
-    /// <summary>
-    /// 硬上限：连按空格翻片时永远凑不出 4 秒空档，线程会一直涨。
-    /// 到这个数就别客气了，关掉预览立刻重启（代价是下一次预览晚 2 秒）。
-    /// </summary>
-    private const int RecycleHardThreadThreshold = 1200;
+    private static void MarkPreviewStarted() => Volatile.Write(ref _gpuDirty, true);
 
-    /// <summary>关掉预览后等这么久再动手，给「连按空格翻片」留出空档。</summary>
-    private const int RecycleIdleDelayMs = 4000;
-
-    private static void MarkPreviewStarted()
+    private static void EnterPanel()
     {
-        Interlocked.Increment(ref _previewEpoch);
+        // 新面板一进来就把正在排队的回收计时作废
+        Interlocked.Increment(ref _recycleToken);
+        Interlocked.Increment(ref _livePanels);
+    }
+
+    /// <summary>面板销毁时调用：最后一个面板走了才开始计时。</summary>
+    private static void LeavePanel()
+    {
+        if (Interlocked.Decrement(ref _livePanels) <= 0)
+            ScheduleRecycleIfNeeded();
     }
 
     private static void ScheduleRecycleIfNeeded()
     {
-        long epoch = Interlocked.Read(ref _previewEpoch);
-        if (Interlocked.Exchange(ref _recycleScheduled, 1) == 1)
-            return;
+        // 这个进程压根没建过引擎设备，没什么好回收的
+        if (!Volatile.Read(ref _gpuDirty)) return;
 
-        int threads;
-        try { threads = Process.GetCurrentProcess().Threads.Count; }
-        catch { Interlocked.Exchange(ref _recycleScheduled, 0); return; }
+        // 上一次的计时不一定已经落地（连按空格翻片时，前一次排队的计时还在路上）。
+        // 只认最后一次：token 对不上就直接作废，否则「最后一部片子关掉」这一次
+        // 会因为前面那次计时抢先跑完而被吃掉——实测就是这么漏掉回收的。
+        int token = Interlocked.Increment(ref _recycleToken);
 
-        bool urgent = threads >= RecycleHardThreadThreshold;
-        int delay = urgent ? 300 : RecycleIdleDelayMs;
-
-        Task.Delay(delay).ContinueWith(_ =>
+        Task.Delay(RecycleIdleDelayMs).ContinueWith(_ =>
         {
-            Interlocked.Exchange(ref _recycleScheduled, 0);
+            if (Interlocked.CompareExchange(ref _recycleToken, 0, token) != token) return;
+            if (Volatile.Read(ref _livePanels) > 0) return;
 
-            // 等待期间又打开了新预览：说明用户还在用，放过这一次。
-            // 硬上限那条不等，涨到这个程度再拖下去就是显存告急。
-            if (!urgent && Interlocked.Read(ref _previewEpoch) != epoch)
-                return;
-
-            int now;
-            try { now = Process.GetCurrentProcess().Threads.Count; }
-            catch { return; }
-
-            if (now < (urgent ? RecycleHardThreadThreshold : RecycleThreadThreshold))
-                return;
-
-            EngineLog($"recycle: 预览已关闭，线程 {now}，重启进程归还显卡资源");
+            int threads = 0;
+            try { threads = Process.GetCurrentProcess().Threads.Count; } catch { }
+            EngineLog($"recycle: 预览已关闭 {RecycleIdleDelayMs / 1000}s，重启进程归还显卡资源 " +
+                      $"(threads={threads})");
             RestartSelf();
         });
     }
@@ -1035,6 +1032,9 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         _lyricLines = null;
         _midiPlayer?.Dispose();
         _midiPlayer = null;
+
+        // 最后一个面板走了才开始算「闲置」：这时候才允许回收
+        LeavePanel();
     }
 
     // ---------------------------------------------------------------- speed menu

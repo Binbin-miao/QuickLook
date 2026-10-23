@@ -150,6 +150,9 @@ public sealed class VideoEngine : IDisposable
     /// <summary>每渲染完一帧触发（在解码线程上）。UI 侧应 Dispatcher 回主线程再 AddDirtyRect。</summary>
     public event Action FrameRendered;
 
+    // 下面这五个都是**借来的**：设备由 GpuContext 全进程共用，引擎只是借用。
+    // 绝不能在这里 Dispose —— 一是别的引擎（关掉一个预览、立刻开下一个）正在用，
+    // 二是给过 MF 硬解的设备本来也放不掉（见 GpuContext 顶部注释）。
     private D3D11Device _device;
     private DeviceContext _ctx;
     private VideoDevice _videoDevice;
@@ -162,6 +165,7 @@ public sealed class VideoEngine : IDisposable
     private D3D11Texture2D _sharedTex;
 
     private SourceReader _reader;
+    /// <summary>借来的：由 GpuContext 持有，不要 Dispose。</summary>
     private DXGIDeviceManager _dxgiManager;
     private int _srcW, _srcH;      // 真实画面尺寸（可能比解码纹理小）
     private int _texW, _texH;      // 解码纹理尺寸（高度按 16 对齐填充过）
@@ -171,6 +175,11 @@ public sealed class VideoEngine : IDisposable
     private ShaderResourceView _bgraSrv;
     private ShaderResourceView _vsrSrv;
     private int _bgraW, _bgraH;
+
+    /// <summary>复用的解码缓冲（每帧覆盖写），尺寸/格式变了才重建。</summary>
+    private D3D11Texture2D _decodeTex;
+    private int _decodeW, _decodeH;
+    private Format _decodeFmt;
 
     // 最终缩放：VSR 输出 → 显示尺寸
     private D3D11Texture2D _outTex;
@@ -378,11 +387,19 @@ public sealed class VideoEngine : IDisposable
     {
         try
         {
-            MediaManager.Startup();
+            // 设备全进程共用。每预览新建一个的话，给过 MF 硬解之后驱动就不回收了，
+            // 实测每关一次预览漏 55 个线程 + 250MB 显存 + 350MB 内存。
+            if (!GpuContext.Acquire())
+            {
+                LastError = "显卡设备不可用: " + GpuContext.LastError;
+                return false;
+            }
 
-            _device = new D3D11Device(DriverType.Hardware,
-                DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
-                FeatureLevel.Level_11_0);
+            _device = GpuContext.Device;
+            _ctx = GpuContext.Context;
+            _videoDevice = GpuContext.VideoDevice;
+            _videoContext = GpuContext.VideoContext;
+            _dxgiManager = GpuContext.DxgiManager;
 
             // 问出「我们实际渲染用的这块卡」是哪家的。注意是设备上的适配器，
             // 不是系统里装了哪几块卡——双显卡笔记本上核显建了设备就不该进 NGX。
@@ -404,6 +421,7 @@ public sealed class VideoEngine : IDisposable
             // 以及 DXGIDeviceManager。D3D11 立即上下文不是线程安全的，
             // 不打开多线程保护时两边并发提交会导致驱动内部死锁——
             // 实测表现就是 seek 之后 _ctx.Flush() 永久阻塞（画面卡死）。
+            // （GpuContext 建设备时已经开过；这里重开一次是幂等的，只为了拿它做诊断。）
             try
             {
                 using (var mt = _device.QueryInterfaceOrNull<Multithread>())
@@ -413,10 +431,6 @@ public sealed class VideoEngine : IDisposable
                 }
             }
             catch (Exception e) { Debug.WriteLine("SetMultithreadProtected: " + e.Message); }
-
-            _ctx = _device.ImmediateContext;
-            _videoDevice = _device.QueryInterface<VideoDevice>();
-            _videoContext = _ctx.QueryInterface<VideoContext>();
 
             _scaler = new Scaler(_device, _ctx);
             if (!_scaler.Prepare())
@@ -428,9 +442,6 @@ public sealed class VideoEngine : IDisposable
             }
 
             CreateD3D9(hwnd);
-
-            _dxgiManager = new DXGIDeviceManager();
-            _dxgiManager.ResetDevice(_device);
 
             var attrs = new MediaAttributes(2);
             attrs.Set(SourceReaderAttributeKeys.D3DManager, _dxgiManager);
@@ -487,7 +498,7 @@ public sealed class VideoEngine : IDisposable
 
             SetupPipeline();
             RenderFrame(firstTex, sub);
-            firstTex.Dispose();
+            // 不再 Dispose：firstTex 是引擎缓存的那张解码缓冲，下一帧还要用
 
             // 音频独立打开；失败不影响视频
             OpenAudio(path);
@@ -1326,7 +1337,7 @@ public sealed class VideoEngine : IDisposable
                     try { _reader.SetCurrentPosition(ticks); } catch (Exception e) { Debug.WriteLine(e.Message); }
                     if (DecodeNext(out var still, out int stillSub, out long stillTs))
                     {
-                        using (still) RenderFrame(still, stillSub);
+                        RenderFrame(still, stillSub);
                         _videoPosHns = stillTs;
                         FrameRendered?.Invoke();
                     }
@@ -1385,7 +1396,10 @@ public sealed class VideoEngine : IDisposable
                 {
                     _diagDropped++;
                     _diagStage = 40;
-                    return;                                  // tex 由 using 释放
+                    // 这里以前写着「tex 由 using 释放」，其实下面那个 using 还没轮到，
+                    // 每丢一帧就漏一张整帧纹理 —— 长 GOP 的片子一次 seek 能丢几十帧。
+                    // 现在解码缓冲是引擎复用的，丢掉就是丢掉，不用（也不能）再放。
+                    return;
                 }
                 Interlocked.Exchange(ref _dropBeforeHns, -1);
             }
@@ -1393,10 +1407,7 @@ public sealed class VideoEngine : IDisposable
             WaitForFrame(timestamp);
 
             _diagStage = 5;
-            using (tex)
-            {
-                RenderFrame(tex, sub);
-            }
+            RenderFrame(tex, sub);
 
             _diagStage = 6;
             _videoPosHns = timestamp;
@@ -1529,17 +1540,31 @@ public sealed class VideoEngine : IDisposable
                 var src = new D3D11Texture2D(ptr);
                 subresource = dxgi.SubresourceIndex;
                 var d = src.Description;
-                tex = new D3D11Texture2D(_device, new Texture2DDescription
+
+                // 解码缓冲复用：以前是每帧 new 一张整帧纹理、渲染完就 Dispose。
+                // 25~60fps 下就是每秒几十次「分配整帧 + 释放」，驱动侧分配器只涨不缩
+                // （实测单次预览光这一项就能多出上百 MB 私有内存）。
+                // 立即上下文上拷贝和渲染是严格有序的，重复用同一张纹理不会串帧。
+                if (_decodeTex == null || _decodeW != d.Width || _decodeH != d.Height || _decodeFmt != d.Format)
                 {
-                    Width = d.Width,
-                    Height = d.Height,
-                    MipLevels = 1,
-                    ArraySize = 1,
-                    Format = d.Format,
-                    SampleDescription = new SampleDescription(1, 0),
-                    Usage = ResourceUsage.Default,
-                    BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
-                });
+                    Release("decodeTex(换尺寸)", _decodeTex);
+                    _decodeTex = new D3D11Texture2D(_device, new Texture2DDescription
+                    {
+                        Width = d.Width,
+                        Height = d.Height,
+                        MipLevels = 1,
+                        ArraySize = 1,
+                        Format = d.Format,
+                        SampleDescription = new SampleDescription(1, 0),
+                        Usage = ResourceUsage.Default,
+                        BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+                    });
+                    _decodeW = d.Width;
+                    _decodeH = d.Height;
+                    _decodeFmt = d.Format;
+                }
+
+                tex = _decodeTex;
                 _ctx.CopySubresourceRegion(src, subresource, null, tex, 0, 0, 0, 0);
                 src.Dispose();
                 return true;
@@ -2028,7 +2053,8 @@ public sealed class VideoEngine : IDisposable
         // 一边释放一边渲染，轻则卡死、重则崩溃。这种情况宁可泄漏，交给 GC 收。
         if (videoStopped)
         {
-            // 上下文里可能还绑着共享纹理，直接释放会阻塞等 GPU；先解绑再放
+            // 上下文里可能还绑着共享纹理，直接释放会阻塞等 GPU；先解绑再放。
+            // 注意上下文是共用的：这里只清状态，不碰任何别人持有的对象。
             lock (_renderLock)
             {
                 try { _ctx?.ClearState(); _ctx?.Flush(); } catch { }
@@ -2036,7 +2062,7 @@ public sealed class VideoEngine : IDisposable
 
             // 逐个释放，单个失败不能拖垮后面的。
             // 原来这里是一串裸 Dispose()：任意一个抛异常（设备丢失、解码器已关），
-            // 后面十几个设备/纹理就全留在那里 —— 表现就是「关掉预览显存不还」。
+            // 后面十几个纹理就全留在那里 —— 表现就是「关掉预览显存不还」。
             Release("sharedTex", _sharedTex);
             Release("surface9", _surface9);
             Release("texture9", _texture9);
@@ -2055,35 +2081,21 @@ public sealed class VideoEngine : IDisposable
             Release("vpEnum", _vpEnum);
             Release("vsrOutTex", _vsrOutTex);
             Release("bgraTex", _bgraTex);
+            Release("decodeTex", _decodeTex);
 
             Release("reader", _reader);
-            Release("dxgiManager", _dxgiManager);
 
-            Release("videoContext", _videoContext);
-            Release("videoDevice", _videoDevice);
-            Release("ctx", _ctx);
-            Release("device", _device);
-
-            // Open() 里每次预览都 MediaManager.Startup()，却从来没 Shutdown 过。
-            // MF 是引用计数的：平台的工作队列线程、解码器缓存都跟着这个计数走，
-            // 只加不减 —— 这就是「每预览一次多 50 多个线程、250MB 显存」的源头。
-            // 必须放在所有 MF 对象释放之后调，否则它会等对象归还而卡住。
-            if (audioStopped)
-            {
-                try
-                {
-                    var swMf = Stopwatch.StartNew();
-                    MediaManager.Shutdown();
-                    ViewerPanel.EngineLog($"mf shutdown {swMf.ElapsedMilliseconds}ms");
-                }
-                catch (Exception e)
-                {
-                    ViewerPanel.EngineLog("mf shutdown 异常: " + e.Message);
-                }
-            }
+            // 设备 / 立即上下文 / 视频处理器 / DXGIDeviceManager / MF 平台
+            // 全部是进程级的（GpuContext），这里一个都不能放：
+            //   * 放了就是把别的引擎正在用的设备抽走；
+            //   * 而且给过 MF 硬解的设备本来也放不掉，Dispose 只是把我们的引用退掉，
+            //     资源照样挂在进程里（实测 42 线程 / 40MB 显存 / 181MB 内存不回落）。
+            // 要真正还回去只能重启进程 —— 那是 ViewerPanel 空闲回收的活。
+            _ctx = null;
+            _videoContext = null;
+            _videoDevice = null;
+            _dxgiManager = null;
+            _device = null;
         }
-
-        // 不调 MFShutdown：它要等所有 MF 对象释放完毕才返回，
-        // 只要有一处没放干净就会永久阻塞，而宿主本身也在用 MF
     }
 }

@@ -272,6 +272,12 @@ internal sealed class AudioOutput : IDisposable
         _master = null;
         _xaudio = null;
 
+        // VoiceNotify 是 CallbackBase：内部拿着一个 GCHandle 指向自己。
+        // 不 Dispose 的话这把句柄永远不释放，这个 AudioOutput 连带它的委托
+        // 就一直挂在进程里（每预览一次漏一个，托管堆上还留着它的池数组）。
+        try { _notify?.Dispose(); } catch { }
+        _notify = null;
+
         if (_pool != null)
         {
             for (int i = 0; i < _pool.Length; i++)

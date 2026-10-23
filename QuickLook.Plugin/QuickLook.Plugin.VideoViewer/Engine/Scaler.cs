@@ -159,6 +159,46 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET
     private readonly D3D11Device _device;
     private readonly DeviceContext _ctx;
 
+    // 着色器只编译一次：以前是每开一次预览就在 D3DCompiler 里编两遍，
+    // 既慢（每次几十毫秒）又会让编译器的进程内存一路往上涨。
+    // 这里把编译结果（含字节码 Blob）静态留住，每个 Scaler 只是拿它建 D3D 对象。
+    private static readonly object _compileLock = new();
+    private static ShaderBytecode _vsBytecode;
+    private static ShaderBytecode _psBytecode;
+    private static string _compileError;
+    private static bool _compiled;
+
+    private static bool EnsureBytecode()
+    {
+        if (_compiled) return _vsBytecode != null;
+
+        lock (_compileLock)
+        {
+            if (_compiled) return _vsBytecode != null;
+            _compiled = true;
+
+            var vsResult = ShaderBytecode.Compile(ShaderSource, "vsMain", "vs_5_0");
+            if (vsResult == null || vsResult.HasErrors)
+            {
+                _compileError = "VS: " + (vsResult?.Message ?? "编译返回空");
+                return false;
+            }
+
+            var psResult = ShaderBytecode.Compile(ShaderSource, "main", "ps_5_0");
+            if (psResult == null || psResult.HasErrors)
+            {
+                _compileError = "PS: " + (psResult?.Message ?? "编译返回空");
+                return false;
+            }
+
+            // 故意不 Dispose：Bytecode 指向结果对象里的 Blob，
+            // 放掉它之后再建 VertexShader 就是野指针。
+            _vsBytecode = vsResult.Bytecode;
+            _psBytecode = psResult.Bytecode;
+            return true;
+        }
+    }
+
     private VertexShader _vs;
     private PixelShader _ps;
     private D3D11Buffer _cb;
@@ -189,25 +229,14 @@ float4 main(float4 pos : SV_POSITION) : SV_TARGET
     {
         try
         {
-            using (var vsResult = ShaderBytecode.Compile(ShaderSource, "vsMain", "vs_5_0"))
+            if (!EnsureBytecode())
             {
-                if (vsResult.HasErrors)
-                {
-                    LastError = "VS: " + vsResult.Message;
-                    return false;
-                }
-                _vs = new VertexShader(_device, vsResult.Bytecode);
+                LastError = _compileError;
+                return false;
             }
 
-            using (var psResult = ShaderBytecode.Compile(ShaderSource, "main", "ps_5_0"))
-            {
-                if (psResult.HasErrors)
-                {
-                    LastError = "PS: " + psResult.Message;
-                    return false;
-                }
-                _ps = new PixelShader(_device, psResult.Bytecode);
-            }
+            _vs = new VertexShader(_device, _vsBytecode);
+            _ps = new PixelShader(_device, _psBytecode);
 
             _cb = new D3D11Buffer(_device, new BufferDescription
             {
