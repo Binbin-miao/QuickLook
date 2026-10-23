@@ -111,6 +111,12 @@ VSR 不只是比双线性锐，也稳定高于 Spline36（+9% ~ +13%），说明
 - **回收只关引擎，不动主程序**：所有预览关掉、闲置 30 秒后，只把引擎子进程关掉，
   QuickLook 本体全程不退出、托盘不闪、游戏里也不会把它当成「程序结束」。
   看片过程中永远不会触发。
+- **排障开关 `IsolatedEngine`**：默认 `true`（引擎跑在独立进程里）。改成 `false` 就退回
+  「引擎直接跑在 QuickLook 进程内」的老跑法——出画面/声音问题时用来二分定位，
+  代价是显存和内存不再归还（那个设备在进程内本来就放不掉）。
+  改法：关掉 QuickLook，编辑 `%APPDATA%\pooi.moe\QuickLook\QuickLook.Plugin.VideoViewer.config`，
+  在 `</Settings>` 前加一行 `<IsolatedEngine>False</IsolatedEngine>`，再启动。
+  当前走的是哪条，看日志里有没有 `proxy: 宿主进程已就绪` 就知道了。
 - 运行中切换 `S/W · H/W` 会带着播放位置和播放状态切过去，不会回到片头。
 
 ## 环境要求
