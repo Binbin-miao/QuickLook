@@ -394,7 +394,11 @@ public partial class App : Application
     private void RunListener(StartupEventArgs e)
     {
         TrayIconManager.Start();
-        if (!e.Args.Contains("/autorun") && !IsUWP)
+
+        // 自重启是我们自己拉的，不是用户手动启动：不要再弹「正在后台运行」——
+        // 一次静默回收就变成一次可见打扰，用户只会觉得「这软件老弹窗」。
+        bool selfRestart = e.Args.Contains(RestartMarker);
+        if (!e.Args.Contains("/autorun") && !selfRestart && !IsUWP)
             TrayIconManager.ShowNotification(string.Empty, TranslationHelper.Get("APP_START"));
         if (e.Args.Contains("/first"))
             AutoStartupHelper.CreateAutorunShortcut();
