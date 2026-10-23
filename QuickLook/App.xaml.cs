@@ -133,8 +133,13 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // 「静默重启」是我们自己发起的：老进程此刻还在退出路上，Mutex 还没交出来。
+        // 把这个标记摘掉，剩下才是真正要预览的文件。
+        bool selfRestart = e.Args.Contains(RestartMarker);
+        string[] args = selfRestart ? e.Args.Where(a => a != RestartMarker).ToArray() : e.Args;
+
         if (!EnsureOSVersion()
-         || !EnsureFirstInstance(e.Args)
+         || !EnsureFirstInstance(args, selfRestart)
          || !EnsureFolderWritable(SettingHelper.LocalDataPath))
         {
             _cleanExit = false;
@@ -145,11 +150,11 @@ public partial class App : Application
         RunListener(e);
 
         // First instance: run and preview this file
-        if (e.Args.Any())
+        if (args.Any())
         {
             try
             {
-                var path = Path.GetFullPath(e.Args.First());
+                var path = Path.GetFullPath(args.First());
                 if (Directory.Exists(path) || File.Exists(path))
                     PipeServerManager.PostMessage(PipeMessages.Toggle, path);
             }
@@ -299,9 +304,46 @@ public partial class App : Application
         return true;
     }
 
-    private bool EnsureFirstInstance(string[] args)
+    /// <summary>
+    /// 静默重启时由旧进程带进来的标记。
+    /// 带它的实例不是「用户又双击了一次」，而是旧进程正在退出的同一份程序，
+    /// 所以既不能弹「已在运行」，也不能把它当文件名。
+    /// </summary>
+    private const string RestartMarker = "--ql-restart";
+
+    /// <summary>自重启最多等这么久让旧进程把 Mutex 交出来。</summary>
+    private const int SelfRestartWaitMs = 20000;
+
+    private bool EnsureFirstInstance(string[] args, bool selfRestart = false)
     {
         _isRunning = new Mutex(true, "QuickLook.App.Mutex", out bool isFirst);
+
+        if (!isFirst && selfRestart)
+        {
+            // 旧进程从「决定重启」到真正退出之间有段空档（收托盘、放 Mutex、走 OnExit），
+            // 以前靠 cmd 里 timeout /t 3 硬等，只要 OnExit 慢一点，新进程就会抢在它前面
+            // 起来，弹一个「QuickLook 已在运行」——用户看到的就是那个框。
+            // 现在改成：等到 Mutex 真的空出来再接管，最多等 20 秒。
+            var sw = Stopwatch.StartNew();
+            while (!isFirst && sw.ElapsedMilliseconds < SelfRestartWaitMs)
+            {
+                Thread.Sleep(120);
+
+                // 必须先关掉自己这份句柄再重试：只要我们还握着它，这个命名对象就不会消失，
+                // createdNew 永远是 false（经典坑）。
+                _isRunning?.Dispose();
+                _isRunning = new Mutex(true, "QuickLook.App.Mutex", out isFirst);
+            }
+
+            if (!isFirst)
+            {
+                // 旧进程没退干净（卡住了）。安静退出，绝不弹窗——
+                // 弹一个框比晚点再重启更扰人，用户下次开预览时自然会再拉起一份。
+                _isRunning?.Dispose();
+                ProcessHelper.WriteLog("self-restart: 等不到旧实例释放 Mutex，放弃本次重启");
+                return false;
+            }
+        }
 
         if (isFirst)
             return true;

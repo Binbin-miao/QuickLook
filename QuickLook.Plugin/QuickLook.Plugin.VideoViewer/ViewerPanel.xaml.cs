@@ -950,9 +950,12 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
             }
 
             // 宿主是单实例（QuickLook.App.Mutex）：直接启动会被新进程自己的 Mutex 检查挡回去，
-            // 所以交给 cmd 延迟 3 秒，等旧进程彻底退出（含托盘、钩子）之后再起。
+            // 所以交给 cmd 延迟一下，等旧进程退出之后再起。
+            // 关键在于后面那个 --ql-restart：带上它，新实例才知道「这是自己人重启」，
+            // 会等 Mutex 真的空出来再接管。不带的话，只要旧进程的 OnExit 慢一点，
+            // 新实例就抢先弹一个「QuickLook 已在运行」——实测就是这么弹出来的。
             Process.Start(new ProcessStartInfo("cmd.exe",
-                $"/c timeout /t 3 /nobreak >nul & start \"\" \"{exe}\"")
+                $"/c timeout /t 2 /nobreak >nul & start \"\" \"{exe}\" --ql-restart")
             {
                 CreateNoWindow = true,
                 UseShellExecute = false,
