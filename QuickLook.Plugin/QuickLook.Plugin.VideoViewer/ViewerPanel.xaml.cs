@@ -752,6 +752,12 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
         {
             DetachSurface();
             engine.SetTargetSize(targetW, targetH);
+
+            // SetTargetSize 只换表面，不重算倍率。窗口从小拖到大以后，显示需要的
+            // 倍数已经变了（打开时往往正好 1:1，那时 VSR 按设计是不开的），
+            // 这里补一次重算，否则「打开再最大化」永远看不到超分。
+            ApplyVsrToEngine();
+
             AttachSurface(engine);
         }
         catch (Exception e)
