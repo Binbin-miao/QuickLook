@@ -119,6 +119,21 @@ internal static class VsrNative
     [DllImport(Dll, CallingConvention = CallingConvention.StdCall)]
     public static extern int VsrAdapterVendor(IntPtr device);
 
+    // ── 色彩空间 v1（ID3D11VideoContext1）────────────────────────────────────
+    // SharpDX 没有 v1 的绑定，所以这三个都走 C++ 桥。
+    // 参数是语义化的整数（0=BT601/1=BT709/2=BT2020，0=G22/1=PQ/2=HLG），
+    // 由 C++ 侧映射成 DXGI_COLOR_SPACE_TYPE——避免 C# 传错枚举值。
+    [DllImport(Dll, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VpHasColorSpace1(IntPtr context);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VpSetStreamColorSpace1(IntPtr context, IntPtr vp, int streamIndex,
+        int rgb, int fullRange, int matrix, int transfer);
+
+    [DllImport(Dll, CallingConvention = CallingConvention.StdCall)]
+    public static extern int VpSetOutputColorSpace1(IntPtr context, IntPtr vp,
+        int rgb, int fullRange, int matrix, int transfer);
+
     // 桥接层返回的是宽字符：源码是 UTF-8 编译，中文若走 char* 再按 ANSI 解码就是乱码。
     public static string LastError => Marshal.PtrToStringUni(VsrLastError()) ?? string.Empty;
 }
@@ -202,9 +217,18 @@ public sealed class VideoEngine : IVideoEngine
 
     private D3D11Texture2D _bgraTex;
     private D3D11Texture2D _vsrOutTex;
+    /// <summary>双层 VSR 的中间结果。和 _vsrOutTex 一样按 4K 上限一次性分配。</summary>
+    private D3D11Texture2D _vsrMidTex;
     private ShaderResourceView _bgraSrv;
     private ShaderResourceView _vsrSrv;
     private int _bgraW, _bgraH;
+
+    /// <summary>
+    /// 实验性：把一次超分拆成两级（倍率开平方，保证乘积等于总倍率）。
+    /// 默认关闭——理论上级联比单级差，靠 QL_VSR2=1 打开做对比测试。
+    /// </summary>
+    public bool VsrTwoStage { get; set; } =
+        Environment.GetEnvironmentVariable("QL_VSR2") == "1";
 
     /// <summary>复用的解码缓冲（每帧覆盖写），尺寸/格式变了才重建。</summary>
     private D3D11Texture2D _decodeTex;
@@ -215,6 +239,24 @@ public sealed class VideoEngine : IVideoEngine
     private D3D11Texture2D _outTex;
     private VideoProcessorOutputView _vpOutFinal;
     private Scaler _scaler;
+
+    // ── HDR ────────────────────────────────────────────────────────────────
+    /// <summary>把 PQ/HLG 压到 SDR。只有 HDR 源才创建。</summary>
+    private ToneMapper _toneMap;
+    /// <summary>本片是否要跑 tone map。</summary>
+    private bool _hdrToneMap;
+    /// <summary>传给 tone map 着色器的传递函数：1=PQ，2=HLG。</summary>
+    private int _toneMapTransfer = 1;
+    private string _toneMapError;
+
+    /// <summary>HDR 峰值亮度（nits）。HDR10 主流是 1000，先按这个压。</summary>
+    private const float HdrPeakNits = 1000f;
+    /// <summary>SDR 参考白（nits）。ITU-R BT.2408 建议 203。</summary>
+    private const float HdrSdrWhiteNits = 203f;
+
+    /// <summary>诊断用：把 SDR 内容强行当 PQ 跑一遍 tone map，验证管线通不通。</summary>
+    private static bool ForceHdrToneMap =>
+        Environment.GetEnvironmentVariable("QL_FORCE_HDR") == "1";
     private int _targetW, _targetH;
     private int _vsrMaxW, _vsrMaxH;     // VSR 输出纹理的固定尺寸（一次性按 4K 分配）
     private int _enumOutW, _enumOutH;   // 枚举器声明的最大输出尺寸
@@ -225,6 +267,45 @@ public sealed class VideoEngine : IVideoEngine
     private VideoProcessorInputView _vpIn;
     private VideoProcessorOutputView _vpOut;
     private int _vpW, _vpH;
+
+    // ── 色彩空间 ────────────────────────────────────────────────────────────
+    // NV12 是「YUV + 有限的取值区间」：电视范围（studio，16-235）或全范围（0-255）。
+    // 这件事必须显式告诉视频处理器，否则驱动自己猜。实测 NVIDIA 在「未指定」时按
+    // 全范围直通，于是 16-235 的片子整幅画面卡在 16..234：黑是 6% 的灰、白差一口气，
+    // 观感就是「偏灰、黑色不黑」。原播放器（LAV 软解）会自己展开，所以两条路径对不上。
+    //
+    // 规则（没有元数据时按行业惯例）：
+    //   * 矩阵：流里写了就照写；没写则 高度 ≥ 720 用 BT.709、否则 BT.601
+    //   * 范围：流里写了就照写；没写一律按 studio（16-235）
+    //   * 输出一律 RGB full（0-255），展开过的数据不能再被第二趟 Blt 压回去
+    private int _mtYuvMatrix = -1;       // MF_MT_YUV_MATRIX，-1 = 流里没写
+    private int _mtNominalRange = -1;    // MF_MT_VIDEO_NOMINAL_RANGE，-1 = 流里没写
+    private int _mtTransfer = -1;        // MF_MT_TRANSFER_FUNCTION：15=PQ，16=HLG
+    private int _mtPrimaries = -1;       // MF_MT_VIDEO_PRIMARIES：9=BT.2020
+    private bool _csFullRange;           // 源是不是 0-255
+    /// <summary>矩阵：0 = BT.601，1 = BT.709，2 = BT.2020-NCL。</summary>
+    private int _csMatrix = 1;
+    /// <summary>传递函数：0 = gamma 2.2（SDR），1 = PQ（HDR10），2 = HLG。</summary>
+    private int _csTransfer;
+    /// <summary>源是 BT.2020 原色（HDR 片基本都是）。</summary>
+    private bool _csBt2020;
+
+    /// <summary>走 v1（DXGI_COLOR_SPACE_TYPE）还是回退 v0（DXVA2_ExtendedFormat）。</summary>
+    private bool _useColorSpace1;
+    private bool _colorSpace1Probed;
+    /// <summary>v1 调用失败后本次会话不再尝试，避免每帧抛/每帧失败。</summary>
+    private bool _colorSpace1Broken;
+
+    /// <summary>一旦拒绝色彩空间声明就永久关掉，不能每帧抛异常。</summary>
+    private bool _colorSpaceUsable = true;
+    private string _colorSpaceNote = "未判定";
+
+    /// <summary>诊断用：当前判定到的色彩空间、走的哪代接口、声明是否成功。</summary>
+    public string ColorSpaceInfo =>
+        $"{_colorSpaceNote} 声明={(_colorSpaceUsable ? "ok" : "失败")} " +
+        $"接口={(_useColorSpace1 && !_colorSpace1Broken ? "v1" : "v0")} " +
+        $"hdr={(_hdrToneMap ? "on" : "off")} tm={(_toneMap != null ? "ready" : "null")} " +
+        $"force={ForceHdrToneMap} tmErr={_toneMapError ?? "-"}";
 
     /// <summary>渲染与管线重建互斥：重建时不能有帧正在用旧纹理。</summary>
     private readonly object _renderLock = new();
@@ -241,6 +322,10 @@ public sealed class VideoEngine : IVideoEngine
     private volatile bool _paused;
     private double _rate = 1.0;
     private long _seekTicks = -1;
+    /// <summary>上次 seek 的时刻（TickCount）：用来区分「用户还在拖」和「已经停手」。</summary>
+    private int _lastSeekAt;
+    /// <summary>停手之后还要追到的精确位置；-1 表示没有待办。</summary>
+    private long _precisePending = -1;
 
     /// <summary>
     /// seek 之后解码器会从「前一个关键帧」开始吐帧，长 GOP 的片可能早十几秒。
@@ -498,6 +583,11 @@ public sealed class VideoEngine : IVideoEngine
             }
 
             Log("open: 协商 NV12 输出");
+
+            // 色彩元数据要在协商之后读：先问原生类型（H.264 的 VUI 写在它上面），
+            // 再问协商后的 NV12 类型。很多片源（尤其是网络压制的 mp4）两个都没有。
+            ReadColorMetadata();
+
             // 真实画面尺寸要在这里读：解码之后 MF 会把当前媒体类型换成对齐后的尺寸
             int mediaW = 0, mediaH = 0;
             try
@@ -559,6 +649,276 @@ public sealed class VideoEngine : IVideoEngine
         }
     }
 
+    /// <summary>
+    /// 读源视频的色彩元数据。先看原生类型（编码器写进 VUI 的矩阵/范围会转成
+    /// MF_MT_YUV_MATRIX / MF_MT_VIDEO_NOMINAL_RANGE），再看协商后的类型。
+    /// 两处都读不到就保持 -1，留给 DecideColorSpace 按惯例判定。
+    /// </summary>
+    private void ReadColorMetadata()
+    {
+        _mtYuvMatrix = -1;
+        _mtNominalRange = -1;
+        _mtTransfer = -1;
+        _mtPrimaries = -1;
+
+        // 原生类型优先：它代表「作者写的」，NV12 类型是「我们要的」，后者有时会把
+        // 色彩属性留在转换链上、有时直接丢光。
+        for (int pass = 0; pass < 2; pass++)
+        {
+            MediaType mt = null;
+            try
+            {
+                mt = pass == 0
+                    ? _reader.GetNativeMediaType(SourceReaderIndex.FirstVideoStream, 0)
+                    : _reader.GetCurrentMediaType(SourceReaderIndex.FirstVideoStream);
+
+                if (TryGetInt(mt, MediaTypeAttributeKeys.YuvMatrix, out int matrix))
+                    _mtYuvMatrix = matrix;
+                if (TryGetInt(mt, MediaTypeAttributeKeys.VideoNominalRange, out int range))
+                    _mtNominalRange = range;
+                if (TryGetInt(mt, MediaTypeAttributeKeys.TransferFunction, out int transfer))
+                    _mtTransfer = transfer;
+                if (TryGetInt(mt, MediaTypeAttributeKeys.VideoPrimaries, out int primaries))
+                    _mtPrimaries = primaries;
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"[color] 读元数据(pass={pass})失败: {e.Message}");
+            }
+            finally
+            {
+                mt?.Dispose();
+            }
+
+            if (_mtYuvMatrix >= 0 && _mtNominalRange >= 0 &&
+                _mtTransfer >= 0 && _mtPrimaries >= 0) break;
+        }
+
+        Log($"color: 元数据 矩阵={_mtYuvMatrix} 范围={_mtNominalRange} " +
+            $"传递={_mtTransfer} 原色={_mtPrimaries}（-1 表示流里没写）");
+    }
+
+    /// <summary>读一个整型媒体属性；属性不存在时返回 false（MF 会抛异常，不能当成 0）。</summary>
+    private static bool TryGetInt(MediaType mt, MediaAttributeKey<int> key, out int value)
+    {
+        value = 0;
+        if (mt == null) return false;
+        try
+        {
+            value = mt.Get(key);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 决定 NV12 输入该按哪种色彩空间解释。必须在 _srcH 已知之后调用。
+    /// MF 的取值：MFVideoTransferMatrix_BT709=1 / BT601=2 / SMPTE240M=3；
+    /// MFNominalRange_Normal=1（0-255，全范围）/ Wide=2（16-235，电视范围）。
+    /// </summary>
+    private void DecideColorSpace()
+    {
+        // 传递函数：MF 的 15 = SMPTE 2084(PQ)，16 = HLG（见 mfobjects.h）
+        _csTransfer = _mtTransfer == 15 ? 1 : (_mtTransfer == 16 ? 2 : 0);
+        // BT.2020 原色：HDR 片基本都是，SDR 片偶尔也有宽色域
+        _csBt2020 = _mtPrimaries == 9;
+
+        // 矩阵三态。MF 的取值见 mfobjects.h：1=709，2=601，3=240M，4/5=BT.2020
+        switch (_mtYuvMatrix)
+        {
+            case 2: _csMatrix = 0; break;                 // BT.601
+            case 4:
+            case 5: _csMatrix = 2; break;                 // BT.2020-10 / 12
+            case 1:
+            case 3: _csMatrix = 1; break;                 // BT.709 / SMPTE240M
+            default:
+                // 流里没写：HDR 必然是 BT.2020；SD 按 601；其余按 709
+                _csMatrix = _csBt2020 ? 2 : (_srcH < 720 ? 0 : 1);
+                break;
+        }
+
+        // 没写范围时一律按电视范围：这是压制的绝对主流，也是「黑不黑」的关键。
+        _csFullRange = _mtNominalRange == 1;
+
+        string m = _csMatrix == 2 ? "BT.2020" : (_csMatrix == 0 ? "BT.601" : "BT.709");
+        string t = _csTransfer == 1 ? "PQ(HDR10)" : (_csTransfer == 2 ? "HLG" : "gamma2.2");
+        string r = _csFullRange ? "FULL(0-255)" : "STUDIO(16-235)";
+
+        _colorSpaceNote = $"{_srcW}x{_srcH} {m} {r} {t}";
+
+        Log($"color: 判定 {_colorSpaceNote}" +
+            $"{(isHdr ? "  ★ HDR 源" : "")}" +
+            $"{(_csFullRange ? "" : "  → 由驱动展开成 0-255")}");
+    }
+
+    /// <summary>源是不是 HDR（PQ 或 HLG）。tone mapping 是否介入看这个。</summary>
+    private bool isHdr => _csTransfer >= 1;
+
+    /// <summary>
+    /// HDR 才准备 tone map，SDR 片这条路一步都不走。
+    /// 失败就整体放弃（退回直通）：半开半闭的后果是画面发灰，还找不到原因。
+    /// </summary>
+    private void SetupToneMap()
+    {
+        if (!isHdr && !ForceHdrToneMap)
+        {
+            _hdrToneMap = false;
+            return;
+        }
+
+        if (_toneMap != null)
+        {
+            _hdrToneMap = true;
+            return;
+        }
+
+        var tm = new ToneMapper(_device, _ctx);
+        if (!tm.Prepare())
+        {
+            _toneMapError = tm.LastError ?? "未知";
+            Log("hdr: tone map 初始化失败，退回直通 —— " + _toneMapError);
+            tm.Dispose();
+            _hdrToneMap = false;
+            return;
+        }
+
+        _toneMap = tm;
+        _hdrToneMap = true;
+        // 诊断模式：内容其实是 SDR，但按 PQ 解码——用它确认这个 pass 真的在跑。
+        _toneMapTransfer = ForceHdrToneMap ? 1 : Math.Max(1, _csTransfer);
+
+        Log($"hdr: tone map 就绪 transfer={(_toneMapTransfer == 1 ? "PQ" : "HLG")} " +
+            $"peak={HdrPeakNits:0}nits white={HdrSdrWhiteNits:0}nits");
+    }
+
+    /// <summary>
+    /// 给视频处理器的第 0 号输入流声明色彩空间。每趟 Blt 之前都要设一次，
+    /// 因为同一个处理器会交替吃 NV12（第一趟）和 BGRA（缩放趟）。
+    /// <paramref name="rgbInput"/> = true 表示这一趟吃的是已经转好的 RGB。
+    /// 返回 false 表示这台机器不吃这一套，调用方照旧跑。
+    /// </summary>
+    private bool TrySetStreamColorSpace(VideoProcessor vp, bool rgbInput)
+    {
+        if (vp == null || !_colorSpaceUsable) return false;
+
+        // v1 优先：DXGI_COLOR_SPACE_TYPE 语义明确，而且是唯一能表达 PQ / HLG 的接口。
+        // v0 的 DXVA2_ExtendedFormat 传递函数枚举里根本没有这两项。
+        if (_useColorSpace1 && !_colorSpace1Broken)
+        {
+            try
+            {
+                int rc = VsrNative.VpSetStreamColorSpace1(
+                    _ctx.NativePointer, vp.NativePointer, 0,
+                    rgbInput ? 1 : 0,
+                    rgbInput ? 1 : (_csFullRange ? 1 : 0),
+                    rgbInput ? 1 : _csMatrix,
+                    rgbInput ? 0 : _csTransfer);
+
+                if (rc == 0) return true;
+
+                // 失败一次就不再试：每帧都失败比老实走 v0 更糟。
+                _colorSpace1Broken = true;
+                Log($"color: v1 设置输入失败 rc={rc}，本次会话退回 v0");
+            }
+            catch (Exception e)
+            {
+                _colorSpace1Broken = true;
+                Log("color: v1 输入调用异常，退回 v0 —— " + e.Message);
+            }
+        }
+
+        try
+        {
+            _videoContext.VideoProcessorSetStreamColorSpace(vp, 0, BuildColorSpace(rgbInput));
+            return true;
+        }
+        catch (Exception e)
+        {
+            // 一次失败就永久关掉：每帧抛一次异常比颜色不对更糟。
+            _colorSpaceUsable = false;
+            LastError = "色彩空间设置失败: " + e.Message;
+            Log("color: 设置失败，退回驱动默认行为 —— " + e.Message);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 探测这台机器有没有 ID3D11VideoContext1（Win10 15063+）。
+    /// 只查一次：结果存下来，整个会话不再变。
+    /// </summary>
+    private void ProbeColorSpace1()
+    {
+        if (_colorSpace1Probed) return;
+        _colorSpace1Probed = true;
+
+        try
+        {
+            _useColorSpace1 = VsrNative.Prepare() &&
+                              VsrNative.VpHasColorSpace1(_ctx.NativePointer) == 1;
+        }
+        catch (Exception e)
+        {
+            _useColorSpace1 = false;
+            Log("color: v1 探测失败 —— " + e.Message);
+        }
+
+        Log($"color: 接口 = {(_useColorSpace1 ? "v1 (DXGI_COLOR_SPACE_TYPE)" : "v0 (DXVA2_ExtendedFormat，HDR 不可用)")}");
+    }
+
+    /// <summary>
+    /// 组一个 DXVA2_ExtendedFormat。位域：
+    ///   SampleFormat:8 | ChromaSubsampling:4 | NominalRange:3 | TransferMatrix:3 |
+    ///   Lighting:4 | Primaries:5 | TransferFunction:5
+    /// 只填真正影响观感的三项（色度采样、取值区间、矩阵），其余留 Unknown 交给驱动。
+    /// </summary>
+    private VideoProcessorColorSpace BuildColorSpace(bool rgbInput)
+    {
+        // NominalRange：1 = PC 全范围(0-255)，2 = TV 电视范围(16-235)
+        int range = rgbInput ? 1 : (_csFullRange ? 1 : 2);
+        // VideoTransferMatrix：1 = BT.709，2 = BT.601；RGB 输入没有矩阵概念。
+        // 注意 v0 的枚举只到 SMPTE240M，**没有 BT.2020**——HDR 片在这里只能近似成 709，
+        // 这也是「补 HDR 必须先上 v1」的直接原因。
+        int matrix = rgbInput ? 0 : (_csMatrix == 0 ? 2 : 1);
+        // VideoChromaSubsampling：1 = MPEG2（4:2:0，也就是 NV12）
+        int chroma = rgbInput ? 0 : 1;
+
+        int value = (0 << 0)            // SampleFormat = unknown（逐行由 SetStreamFrameFormat 管）
+                  | (chroma << 8)
+                  | (range << 12)
+                  | (matrix << 15)
+                  | (0 << 18)           // VideoLighting = unknown
+                  | (0 << 22)           // VideoPrimaries = unknown
+                  | (0 << 27);          // VideoTransferFunction = unknown
+
+        return MakeColorSpace(value);
+    }
+
+    /// <summary>
+    /// 这个版本的 SharpDX 没给 VideoProcessorColorSpace 暴露任何字段，但 COM 那边
+    /// 要的就是 4 字节的 DXVA2_ExtendedFormat。直接按内存布局造一个，
+    /// 既不用 unsafe，也不用猜字段名。
+    /// </summary>
+    private static VideoProcessorColorSpace MakeColorSpace(int value)
+    {
+        Type t = typeof(VideoProcessorColorSpace);
+        int size = Marshal.SizeOf(t);
+        IntPtr p = Marshal.AllocHGlobal(size);
+        try
+        {
+            // 整个结构先清零，再把有效位写进前 4 字节
+            for (int i = 0; i < size; i++) Marshal.WriteByte(p, i, 0);
+            if (size >= 4) Marshal.WriteInt32(p, 0, value);
+            return (VideoProcessorColorSpace)Marshal.PtrToStructure(p, t);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(p);
+        }
+    }
+
     private bool TryGetDuration()
     {
         try
@@ -601,6 +961,8 @@ public sealed class VideoEngine : IVideoEngine
     private void SetupPipeline()
     {
         Log($"setup: 开始 {_srcW}x{_srcH} target={_targetW}x{_targetH}");
+        DecideColorSpace();
+        SetupToneMap();
         // 重配时先拆掉上一轮的资源
         _vpOut?.Dispose(); _vpOut = null;
         _vp?.Dispose(); _vp = null;
@@ -655,6 +1017,41 @@ public sealed class VideoEngine : IVideoEngine
         _enumOutW = maxOutW;
         _enumOutH = maxOutH;
         _videoDevice.CreateVideoProcessor(_vpEnum, 0, out _vp);
+
+        // 先探测有没有 v1 接口，再声明颜色。探测结果整个会话有效。
+        ProbeColorSpace1();
+
+        // 输出统一声明成 full-range RGB。不声明的话，驱动可能把「已经展开成 0-255」
+        // 的数据再按电视范围理解一次，于是第二趟 Blt（VSR 降采样）又把它压回去。
+        if (_colorSpaceUsable)
+        try
+        {
+            bool done = false;
+
+            if (_useColorSpace1 && !_colorSpace1Broken)
+            {
+                // 输出永远是 sRGB full range：tone mapping 之后的数据是标准 SDR。
+                try
+                {
+                    done = VsrNative.VpSetOutputColorSpace1(
+                        _ctx.NativePointer, _vp.NativePointer, 1, 1, 1, 0) == 0;
+                }
+                catch (Exception e)
+                {
+                    Log("color: v1 输出调用异常 —— " + e.Message);
+                }
+            }
+
+            if (!done)
+                _videoContext.VideoProcessorSetOutputColorSpace(_vp, BuildColorSpace(true));
+
+            Log($"color: 输出 = RGB full (0-255)  接口={(_useColorSpace1 && !_colorSpace1Broken ? "v1" : "v0")}");
+        }
+        catch (Exception e)
+        {
+            // 输出侧失败只影响观感，不影响出帧，绝不能因此中断管线。
+            Log("color: 输出色彩空间声明失败，沿用驱动默认 —— " + e.Message);
+        }
         Log("setup: 建输出视图");
         _vpW = _bgraW;
         _vpH = _bgraH;
@@ -665,13 +1062,13 @@ public sealed class VideoEngine : IVideoEngine
                 Texture2D = new Texture2DVpov { MipSlice = 0 },
             }, out _vpOut);
 
+        // 这里**故意不**初始化 VSR。NGX 初始化实测 400ms 左右：
+        //   VSR 关：Open + 首帧 = 620ms
+        //   VSR 开：Open + 首帧 = 1050ms（多出来的就是它挡在首帧前面）
+        // 现在是首帧先用普通路径出画面，UI 层在画面出来之后再调 ActivateVsr()
+        // 补上超分。运行中切换 VSR 的机制本来就是好的（闸门 + 渲染锁），
+        // 只是以前没人用它来「先出画面」。
         VsrActive = false;
-        if (VsrEnabled && EffectiveVsrScale() > 1.0)
-        {
-            Log("setup: 准备 VSR 资源");
-            SetupVsrResources();
-            Log("setup: VSR 资源就绪");
-        }
 
         if (!VsrActive)
         {
@@ -695,11 +1092,17 @@ public sealed class VideoEngine : IVideoEngine
 
     /// <summary>
     /// 实际生效的超分倍率。用户选的是「输出高度的上限」，这里换算成倍率，
-    /// 并夹在两个约束之间：
-    ///   * 不超过用户选的上限（1K/2K/4K）；
-    ///   * 不超过显示区域需要的倍数——产出比屏幕还多的像素只会被缩回去，白烧 GPU；
-    ///   * 不超过 NGX 规格的 4x。
-    /// 夹完之后没有放大（源已经够大）就返回 1.0，等于不超分。
+    /// 只夹 NGX 规格的 4x，**不再按显示区域缩水**。
+    /// <para>
+    /// 以前这里还要再夹一个「不超过显示区域需要的倍数」，理由是「产出比屏幕还多的
+    /// 像素只会被缩回去，白烧 GPU」。但那样 1080p 片在 1080p 屏上根本不会超分
+    /// （倍率 0.955 &lt; 1），用户选 4K 档等于没反应。
+    /// </para>
+    /// <para>
+    /// 现在按用户选的档位老实超分：1080p → 2160（2x）再降采样回屏幕，等于超采样，
+    /// 细节和边缘会比直接缩放更干净。代价是 GPU 开销变成 4 倍左右——这是用户
+    /// 明确要的取舍（「强制按档位超分」）。
+    /// </para>
     /// </summary>
     private double EffectiveVsrScale()
     {
@@ -707,13 +1110,6 @@ public sealed class VideoEngine : IVideoEngine
         if (VsrCapHeight <= 0 || _srcH <= 0) return 1.0;
 
         double scale = VsrCapHeight / (double)_srcH;
-
-        // 显示区域需要的倍数：比它更大没有意义
-        if (_targetW > 0 && _targetH > 0 && _srcW > 0)
-        {
-            double fit = Math.Min(_targetW / (double)_srcW, _targetH / (double)_srcH);
-            if (fit < scale) scale = fit;
-        }
 
         // NGX VSR 的规格上限是 4x。超过 4x 它不会更锐利，只会更慢甚至被拒绝。
         if (scale > 4.0) scale = 4.0;
@@ -723,6 +1119,38 @@ public sealed class VideoEngine : IVideoEngine
         if (scale <= 1.001) return 1.0;
 
         return scale;
+    }
+
+    /// <summary>
+    /// 双层 VSR 的中间纹理。按 4K 上限一次性分配，之后换倍率不再重建
+    /// （和 _vsrOutTex 同一个理由：重建就要碰管线，容易黑屏甚至卡死）。
+    /// </summary>
+    private bool EnsureVsrMidTex()
+    {
+        if (_vsrMidTex != null) return true;
+        if (_vsrMaxW <= 0 || _vsrMaxH <= 0) return false;
+
+        try
+        {
+            _vsrMidTex = new D3D11Texture2D(_device, new Texture2DDescription
+            {
+                Width = _vsrMaxW,
+                Height = _vsrMaxH,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource | BindFlags.UnorderedAccess,
+            });
+            Log($"vsr2: 中间纹理 {_vsrMaxW}x{_vsrMaxH} 就绪");
+            return true;
+        }
+        catch (Exception e)
+        {
+            Log("vsr2: 中间纹理创建失败 —— " + e.Message);
+            return false;
+        }
     }
 
     /// <summary>
@@ -1307,11 +1735,51 @@ public sealed class VideoEngine : IVideoEngine
         if (_device == null) return false;
         if (VsrUnsupported) return false;
 
-        SetupVsrResources();
+        // 只回答「能不能」，**不初始化 NGX**。
+        // 以前这里直接 SetupVsrResources()，等于把 400ms 的 AI 初始化塞进开流路径，
+        // 而且它是在 Start() 之前跑的——首帧必须等它做完才可能出现。
+        // 现在只问渲染设备上的适配器厂商（纯 CPU 查询，微秒级），
+        // 真正的初始化推迟到画面出来以后由 UI 层触发 ActivateVsr()。
+        try
+        {
+            if (!VsrNative.Prepare())          // 只加载 DLL，不碰 NGX
+            {
+                MarkVsrUnsupported("VSR 组件缺失: " + VsrNative.PrepareError);
+                return false;
+            }
 
-        // 探测本身不该改变用户的开关：把 VsrActive 按真实设置重算一遍。
-        Reconfigure(VsrCapHeight, VsrQuality, VsrEnabled);
-        return VsrReady;
+            int vendor = VsrNative.VsrAdapterVendor(_device.NativePointer);
+            if (vendor != 0x10DE)
+            {
+                // 非 N 卡必须在这里就返回：在别家驱动上调 NGX 是未定义行为。
+                MarkVsrUnsupported($"渲染设备不是 NVIDIA（vendor=0x{vendor:X}）");
+                return false;
+            }
+        }
+        catch (Exception e)
+        {
+            MarkVsrUnsupported("VSR 探测失败: " + e.Message);
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 这台机器是否「可能」支持 VSR：只看厂商，不看 NGX 有没有真的初始化成功。
+    /// UI 用它决定按钮显示与否（非 N 卡直接隐藏），不触发任何 GPU 工作。
+    /// </summary>
+    public bool VsrLikelyAvailable
+    {
+        get
+        {
+            if (_device == null || VsrUnsupported) return false;
+            try
+            {
+                return VsrNative.Prepare() && VsrNative.VsrAdapterVendor(_device.NativePointer) == 0x10DE;
+            }
+            catch { return false; }
+        }
     }
 
     // ================================================================ playback
@@ -1356,6 +1824,7 @@ public sealed class VideoEngine : IVideoEngine
                 _wallOriginHns = -1;
                 _acLast = -1;
                 _acSameSince = 0;
+                _precisePending = -1;   // 恢复播放，不用再补精确 seek
             }
             _aWake.Set();
         }
@@ -1380,7 +1849,10 @@ public sealed class VideoEngine : IVideoEngine
     {
         get
         {
-            if (_audioOk && _useAudioClock)
+            // 暂停时音频线程不推进，音频时钟会停在旧位置。这时候必须只信视频位置：
+            // 否则拖动进度条 / 按方向键 seek 完，帧回调把旧的音频位置写回进度条，
+            // 表现就是「拖完弹回原处」「按住方向键位置不跟手」。
+            if (!_paused && _audioOk && _useAudioClock)
             {
                 long a = _audio?.PositionHns() ?? -1;
                 if (a >= 0) return TimeSpan.FromTicks(a);
@@ -1401,6 +1873,7 @@ public sealed class VideoEngine : IVideoEngine
             return;
 
         _seekTicks = ticks;
+        _lastSeekAt = Environment.TickCount;   // 渲染线程靠它判断「还在拖」还是「停手了」
         Interlocked.Exchange(ref _aSeekHns, ticks);
         _wake.Set();
         _aWake.Set();
@@ -1431,16 +1904,55 @@ public sealed class VideoEngine : IVideoEngine
 
             if (_paused)
             {
-                // 暂停时也要响应 seek：解一帧并显示，拖动进度条才有画面
+                // 暂停态的 seek 分两段走，这是「拖得动」和「停得准」的取舍：
+                //
+                //   拖动中（距上次 seek < 180ms）→ 只解到最近关键帧，一帧就出画面。
+                //       用户手指还在动，画面必须跟得上；精确位置等他停手再说。
+                //   停手后（超过 180ms 没新 seek）→ 从当前位置继续解，追到精确时间。
+                //
+                // 以前只有前半段（永远停在关键帧，实测差 6 秒），改成全程精确又会在
+                // 连发时每次都重新定位、一帧都追不完，画面反而更卡。两段配合才既跟手又准。
                 if (_seekTicks >= 0)
                 {
                     long ticks = Interlocked.Exchange(ref _seekTicks, -1);
+                    _precisePending = ticks;
                     try { _reader.SetCurrentPosition(ticks); } catch (Exception e) { Debug.WriteLine(e.Message); }
+
                     if (DecodeNext(out var still, out int stillSub, out long stillTs))
                     {
                         RenderFrame(still, stillSub);
                         _videoPosHns = stillTs;
                         FrameRendered?.Invoke();
+                    }
+                    _sw.Restart();
+                }
+                else if (_precisePending >= 0 && Environment.TickCount - _lastSeekAt >= 180)
+                {
+                    // 停手了：从当前解码位置一路解到目标，不重新定位（重新定位等于白解）。
+                    long target = _precisePending;
+                    _precisePending = -1;
+
+                    for (int guard = 0; guard < 2000; guard++)
+                    {
+                        if (Interlocked.Read(ref _seekTicks) >= 0)
+                            break;                       // 又按了，交给上面的快速路径
+
+                        if (!DecodeNext(out var still, out int stillSub, out long stillTs))
+                        {
+                            _diagStage = 32;
+                            break;
+                        }
+
+                        if (stillTs < target - 1_000_000)
+                        {
+                            _diagDropped++;              // 还没到目标，丢
+                            continue;
+                        }
+
+                        RenderFrame(still, stillSub);
+                        _videoPosHns = stillTs;
+                        FrameRendered?.Invoke();
+                        break;
                     }
                     _sw.Restart();
                 }
@@ -1698,6 +2210,10 @@ public sealed class VideoEngine : IVideoEngine
                 Texture2D = new Texture2DVpiv { MipSlice = 0, ArraySlice = 0 },
             }, out var inView);
 
+        // 这一句决定「黑是不是黑的」：NV12 的 16-235 要靠它才会被展开成 0-255。
+        // 缺了它驱动会按全范围直通，整幅画面就卡在 16..234 发灰。
+        TrySetStreamColorSpace(_vp, false);
+
         _videoContext.VideoProcessorSetStreamFrameFormat(_vp, 0, VideoFrameFormat.Progressive);
         _videoContext.VideoProcessorSetStreamSourceRect(_vp, 0, true, new RawRectangle(0, 0, _srcW, _srcH));
         _videoContext.VideoProcessorSetStreamDestRect(_vp, 0, true, new RawRectangle(0, 0, _bgraW, _bgraH));
@@ -1717,6 +2233,18 @@ public sealed class VideoEngine : IVideoEngine
         inView.Dispose();
         _diagStage = 52;
 
+        // 1.5) HDR → SDR。必须在 VSR 之前：NGX 是在 SDR 的 8bit RGB 上训练的，
+        // 把 PQ 编码的值直接喂进去，它会把亮度编码当成画面内容。
+        D3D11Texture2D baseTex = _bgraTex;
+        if (_hdrToneMap && _toneMap != null)
+        {
+            _diagStage = 57;
+            _toneMap.Run(_bgraSrv, _bgraW, _bgraH, _toneMapTransfer, HdrPeakNits, HdrSdrWhiteNits);
+            // 输出纹理是 Run 里按需分配的，所以这里不能提前用 Output != null 做门槛，
+            // 那样第一帧永远不跑，Output 也就永远不存在（自锁）。
+            if (_toneMap.Output != null) baseTex = _toneMap.Output;
+        }
+
         // 2) VSR（可选）：输出写进固定纹理的左上角 outW x outH 区域
         int outW = 0, outH = 0;
 
@@ -1731,18 +2259,52 @@ public sealed class VideoEngine : IVideoEngine
             _lastOutW = outW;
             _lastOutH = outH;
 
-            int rc = VsrNative.VsrEvaluate(_ctx.NativePointer, _bgraTex.NativePointer, _bgraW, _bgraH,
-                _vsrOutTex.NativePointer, outW, outH, VsrQuality);
-            if (rc != 0)
+            if (VsrTwoStage && EnsureVsrMidTex())
             {
-                VsrActive = false;
-                LastError = "VSR evaluate 失败: " + VsrNative.LastError;
+                // 两级：源 → 中间 → 目标。倍率开平方，乘积正好等于总倍率。
+                // 第一级的结果先落在一块固定纹理上，第二级再吃它——
+                // 中间尺寸只通过 inW/inH 传，纹理本身不用重建。
+                double half = Math.Sqrt(s);
+                int midW = Math.Min(_vsrMaxW, Even(_srcW * half));
+                int midH = Math.Min(_vsrMaxH, Even(_srcH * half));
+
+                _diagStage = 58;
+                int rc1 = VsrNative.VsrEvaluate(_ctx.NativePointer,
+                    baseTex.NativePointer, _bgraW, _bgraH,
+                    _vsrMidTex.NativePointer, midW, midH, VsrQuality);
+
+                if (rc1 != 0)
+                {
+                    VsrActive = false;
+                    LastError = $"VSR 第一级失败({midW}x{midH}): " + VsrNative.LastError;
+                }
+                else
+                {
+                    int rc2 = VsrNative.VsrEvaluate(_ctx.NativePointer,
+                        _vsrMidTex.NativePointer, midW, midH,
+                        _vsrOutTex.NativePointer, outW, outH, VsrQuality);
+                    if (rc2 != 0)
+                    {
+                        VsrActive = false;
+                        LastError = $"VSR 第二级失败({midW}x{midH} → {outW}x{outH}): " + VsrNative.LastError;
+                    }
+                }
+            }
+            else
+            {
+                int rc = VsrNative.VsrEvaluate(_ctx.NativePointer, baseTex.NativePointer, _bgraW, _bgraH,
+                    _vsrOutTex.NativePointer, outW, outH, VsrQuality);
+                if (rc != 0)
+                {
+                    VsrActive = false;
+                    LastError = "VSR evaluate 失败: " + VsrNative.LastError;
+                }
             }
         }
 
         // 3) 缩放到显示尺寸，再送到共享表面
         _diagStage = 53;
-        var src = VsrActive ? _vsrOutTex : _bgraTex;
+        var src = VsrActive ? _vsrOutTex : baseTex;
         int sw = VsrActive ? outW : _srcW;
         int sh = VsrActive ? outH : _srcH;
         int texW = VsrActive ? _vsrMaxW : _srcW;
@@ -1750,7 +2312,9 @@ public sealed class VideoEngine : IVideoEngine
 
         if (!VsrActive && _srcW == _targetW && _srcH == _targetH)
         {
-            _ctx.CopyResource(_bgraTex, _sharedTex);
+            // 直通：源就是显示尺寸，拷的必须是「实际跑的那条链路」的产物
+            // （HDR 片这里是 tone map 的输出，不是 _bgraTex）。
+            _ctx.CopyResource(baseTex, _sharedTex);
         }
         else
         {
@@ -1799,6 +2363,10 @@ public sealed class VideoEngine : IVideoEngine
                     Texture2D = new Texture2DVpiv { MipSlice = 0, ArraySlice = 0 },
                 }, out var inView);
 
+            // 这一趟吃的是 RGB（VSR 输出或上一趟的转换结果），必须声明成 full range，
+            // 否则驱动会拿它当电视范围再压一次，画面二次发灰。
+            TrySetStreamColorSpace(_vp, true);
+
             _videoContext.VideoProcessorSetStreamFrameFormat(_vp, 0, VideoFrameFormat.Progressive);
             _videoContext.VideoProcessorSetStreamSourceRect(_vp, 0, true, new RawRectangle(0, 0, sw, sh));
             _videoContext.VideoProcessorSetStreamDestRect(_vp, 0, true, new RawRectangle(0, 0, _targetW, _targetH));
@@ -1831,7 +2399,12 @@ public sealed class VideoEngine : IVideoEngine
     {
         if (_scaler == null) return false;
 
-        var srv = ReferenceEquals(src, _vsrOutTex) ? _vsrSrv : _bgraSrv;
+        // 三条来源三种 SRV：VSR 输出 / tone map 输出 / 原始 BGRA。
+        // 认错了就是「读着未 tone map 的 PQ 数据去做缩放」，HDR 下画面会直接错。
+        ShaderResourceView srv;
+        if (ReferenceEquals(src, _vsrOutTex)) srv = _vsrSrv;
+        else if (_toneMap != null && ReferenceEquals(src, _toneMap.Output)) srv = _toneMap.OutputSrv;
+        else srv = _bgraSrv;
         if (srv == null) return false;
 
         try
@@ -2171,6 +2744,7 @@ public sealed class VideoEngine : IVideoEngine
             Release("d3d9", _d3d9);
 
             Release("scaler", _scaler);
+            Release("toneMap", _toneMap);
             Release("vpOutFinal", _vpOutFinal);
             Release("outTex", _outTex);
             Release("bgraSrv", _bgraSrv);
@@ -2181,6 +2755,7 @@ public sealed class VideoEngine : IVideoEngine
             Release("vp", _vp);
             Release("vpEnum", _vpEnum);
             Release("vsrOutTex", _vsrOutTex);
+            Release("vsrMidTex", _vsrMidTex);
             Release("bgraTex", _bgraTex);
             Release("decodeTex", _decodeTex);
 

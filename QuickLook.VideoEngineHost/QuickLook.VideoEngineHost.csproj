@@ -45,6 +45,7 @@
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/VideoEngine.cs" Link="Engine/VideoEngine.cs" />
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/GpuContext.cs" Link="Engine/GpuContext.cs" />
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/Scaler.cs" Link="Engine/Scaler.cs" />
+    <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/ToneMapper.cs" Link="Engine/ToneMapper.cs" />
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/TimeStretcher.cs" Link="Engine/TimeStretcher.cs" />
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/AudioOutput.cs" Link="Engine/AudioOutput.cs" />
     <Compile Include="../QuickLook.Plugin/QuickLook.Plugin.VideoViewer/Engine/IVideoEngine.cs" Link="Engine/IVideoEngine.cs" />

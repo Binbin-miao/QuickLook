@@ -615,6 +615,30 @@ public partial class ViewerPanel : UserControl, IDisposable, INotifyPropertyChan
             ApplyTargetSize();
             Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(ApplyTargetSize));
 
+            // 画面已经能出了，这时候再补 VSR。
+            // NGX 初始化实测 400ms（VSR 开 1050ms vs 关 620ms），以前它挡在首帧前面，
+            // 就是「按空格要等一秒」的来源。现在挪到画面出来之后的空闲档位，
+            // 用户先看到画面，超分在几百毫秒内无缝追上来。
+            if (engine.VsrEnabled)
+            {
+                Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+                {
+                    if (_disposed || !ReferenceEquals(_engine, engine)) return;
+                    try
+                    {
+                        var t = System.Diagnostics.Stopwatch.StartNew();
+                        bool ok = engine.ActivateVsr();
+                        EngineLog($"VSR 后台激活 {(ok ? "ok" : "失败")} {t.ElapsedMilliseconds}ms  " +
+                                  $"out={engine.OutputWidth}x{engine.OutputHeight}  " +
+                                  $"err={(string.IsNullOrEmpty(engine.LastError) ? "-" : engine.LastError)}");
+                    }
+                    catch (Exception e)
+                    {
+                        EngineLog("VSR 后台激活异常 " + e.Message);
+                    }
+                }));
+            }
+
             EngineLog($"open OK  {Path.GetFileName(path)}  " +
                       $"{engine.SourceWidth}x{engine.SourceHeight} → {engine.OutputWidth}x{engine.OutputHeight}  " +
                       $"VSR={(engine.VsrActive ? "on" : "off")}  audio={(engine.AudioAvailable ? "on" : "off")}  " +
